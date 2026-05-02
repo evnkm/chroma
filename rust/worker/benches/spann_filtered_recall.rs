@@ -8,10 +8,19 @@
 // `adaptive_search_nprobe` bucketing.
 //
 // Strategies:
-//   BENCH_STRATEGY=fixed     => nprobe_used = base_nprobe
-//   BENCH_STRATEGY=adaptive  => nprobe_used = clamp(base_nprobe / max(sel, eps),
-//                                                  base_nprobe,
-//                                                  base_nprobe * max_factor)
+//   BENCH_STRATEGY=fixed           => nprobe_used = base_nprobe
+//   BENCH_STRATEGY=adaptive        => harness applies the clamp formula and
+//                                     drives `utils::rng_query` directly with
+//                                     the result. Used to demonstrate the
+//                                     proposed strategy in isolation.
+//   BENCH_STRATEGY=reader_adaptive => exercises the production code path
+//                                     `SpannIndexReader::rng_query(..., Some(sel))`
+//                                     so the reader internally calls
+//                                     `filter_aware_nprobe`. Validates the
+//                                     committed Rust change end-to-end.
+//
+// All three boost formulas are identical: clamp(base / max(sel, eps), base,
+// base * max_factor). Numbers should match within HNSW determinism.
 //
 // Output CSV schema (shared across the project):
 //   dataset, n_records, dim, query_id, k, selectivity, strategy,
@@ -19,7 +28,7 @@
 //   latency_ms, centers, candidates_before_filter, candidates_after_filter
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     fs::{create_dir_all, File},
     io::{BufWriter, Write},
@@ -224,22 +233,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = Box::pin(flusher.flush()).await.expect("flush");
     eprintln!("[bench] index built in {:.1}s", build_t.elapsed().as_secs_f64());
 
-    let reader = Box::pin(SpannIndexReader::from_id(
-        Some(&paths.hnsw_id),
-        &hnsw_provider,
-        &collection_id,
-        params.clone().space.into(),
-        dim,
-        ef_search,
-        Some(&paths.pl_id),
-        Some(&paths.versions_map_id),
-        &blockfile_provider,
-        prefix_path,
-        true,
-        params.clone(),
-    ))
-    .await
-    .expect("spann reader");
+    // Build one reader per base_nprobe with `params.search_nprobe` set so that
+    // the production code path (reader.rng_query) uses each base_nprobe as the
+    // pre-boost starting point. All readers share the same blockfiles; only
+    // the `params` differ.
+    let mut readers: HashMap<usize, SpannIndexReader> = HashMap::new();
+    for &base_np in &base_nprobes {
+        let mut params_for_reader = params.clone();
+        params_for_reader.search_nprobe = base_np as u32;
+        let reader = Box::pin(SpannIndexReader::from_id(
+            Some(&paths.hnsw_id),
+            &hnsw_provider,
+            &collection_id,
+            params_for_reader.clone().space.into(),
+            dim,
+            ef_search,
+            Some(&paths.pl_id),
+            Some(&paths.versions_map_id),
+            &blockfile_provider,
+            prefix_path,
+            false, // disable size-based adaptive_search_nprobe so base_nprobe is honored
+            params_for_reader,
+        ))
+        .await
+        .expect("spann reader");
+        readers.insert(base_np, reader);
+    }
 
     let distance_function: DistanceFunction = params.clone().space.into();
 
@@ -280,8 +299,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gt_n = gt_top.len();
 
             for &base_np in &base_nprobes {
+                let reader = &readers[&base_np];
                 let nprobe_used: usize = match strategy.as_str() {
-                    "adaptive" => {
+                    "adaptive" | "reader_adaptive" => {
                         let raw = base_np as f64 / sel.max(epsilon);
                         raw.clamp(base_np as f64, base_np as f64 * max_factor)
                             .round() as usize
@@ -290,18 +310,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let t0 = Instant::now();
-                let (head_ids, _, _) = rng_query(
-                    query,
-                    reader.hnsw_index.clone(),
-                    nprobe_used,
-                    None,
-                    params.search_rng_epsilon,
-                    params.search_rng_factor,
-                    distance_function.clone(),
-                    false,
-                )
-                .await
-                .expect("rng_query");
+                let (head_ids, _, _) = if strategy == "reader_adaptive" {
+                    // Exercise the production code path: the reader computes
+                    // nprobe internally via `filter_aware_nprobe(base, Some(sel))`.
+                    reader
+                        .rng_query(query, n_records, k, Some(sel))
+                        .await
+                        .expect("reader.rng_query")
+                } else {
+                    rng_query(
+                        query,
+                        reader.hnsw_index.clone(),
+                        nprobe_used,
+                        None,
+                        params.search_rng_epsilon,
+                        params.search_rng_factor,
+                        distance_function.clone(),
+                        false,
+                    )
+                    .await
+                    .expect("rng_query")
+                };
 
                 let mut batch = Vec::with_capacity(head_ids.len());
                 let mut cands_before: usize = 0;
