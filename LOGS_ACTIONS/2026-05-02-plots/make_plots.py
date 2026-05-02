@@ -448,6 +448,196 @@ def fig_baseline_climbs(out: str):
     print(f"wrote {out}")
 
 
+FOURWAY_COLORS = {
+    "none":     "#888888",
+    "adaptive": "#2ca02c",
+    "bloom":    "#1f77b4",
+    "both":     "#d62728",
+}
+FOURWAY_LABELS = {
+    "none":     "neither (probe-blind)",
+    "adaptive": "adaptive nprobe only",
+    "bloom":    "bloom gate only",
+    "both":     "adaptive + bloom",
+}
+FOURWAY_MARKERS = {
+    "none":     "o",
+    "adaptive": "^",
+    "bloom":    "s",
+    "both":     "D",
+}
+
+
+def summarise_4way(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return (
+        df.groupby(["scenario", "probe_base"], as_index=False)
+          .agg(
+              recall=("recall_at_k", "mean"),
+              probe_used=("probe_nbr_used", "mean"),
+              heads_rng=("heads_rng", "mean"),
+              heads_fetched=("heads_fetched", "mean"),
+              drop_ratio=("drop_ratio", "mean"),
+              latency_ms=("latency_ms", "mean"),
+              bad_drops=("bad_drops", "sum"),
+          )
+          .sort_values(["scenario", "probe_base"])
+    )
+
+
+def fig_4way_recall_vs_probe(name: str, title: str, out: str):
+    df = load(name)
+    if df.empty:
+        return
+    s = summarise_4way(df)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for sc in ["none", "adaptive", "bloom", "both"]:
+        rows = s[s.scenario == sc].sort_values("probe_base")
+        if rows.empty:
+            continue
+        ax.plot(
+            rows.probe_base, rows.recall,
+            color=FOURWAY_COLORS[sc], marker=FOURWAY_MARKERS[sc], lw=2.2, ms=8,
+            label=FOURWAY_LABELS[sc],
+        )
+    ax.set_xscale("log", base=2)
+    xs = sorted(s.probe_base.unique())
+    ax.set_xticks(xs)
+    ax.set_xticklabels([str(int(x)) for x in xs])
+    ax.set_xlabel("probe_base (HNSW probe budget before adaptive boost)")
+    ax.set_ylabel("recall@10")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / out)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def fig_4way_recall_vs_io(name: str, title: str, out: str):
+    """The Pareto plot — recall vs actual PL fetches, four lines."""
+    df = load(name)
+    if df.empty:
+        return
+    s = summarise_4way(df)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for sc in ["none", "adaptive", "bloom", "both"]:
+        rows = s[s.scenario == sc].sort_values("heads_fetched")
+        if rows.empty:
+            continue
+        ax.plot(
+            rows.heads_fetched, rows.recall,
+            color=FOURWAY_COLORS[sc], marker=FOURWAY_MARKERS[sc], lw=2.2, ms=8,
+            label=FOURWAY_LABELS[sc],
+        )
+    ax.set_xscale("log")
+    ax.set_xlabel("heads_fetched (mean PL reads per query, log scale)")
+    ax.set_ylabel("recall@10")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / out)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def fig_4way_bars(name: str, probe_base: int, title: str, out: str):
+    """Side-by-side bar at one operating point: recall and PL fetches."""
+    df = load(name)
+    if df.empty:
+        return
+    s = summarise_4way(df)
+    s = s[s.probe_base == probe_base]
+    if s.empty:
+        return
+    s = s.set_index("scenario").reindex(["none", "adaptive", "bloom", "both"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    colors = [FOURWAY_COLORS[sc] for sc in s.index]
+    labels = [FOURWAY_LABELS[sc] for sc in s.index]
+
+    axes[0].bar(labels, s.recall, color=colors)
+    for x, v in zip(range(len(s)), s.recall):
+        axes[0].text(x, v + 0.02, f"{v:.3f}", ha="center", fontsize=10)
+    axes[0].set_ylabel(f"recall@10 (probe_base={probe_base})")
+    axes[0].set_ylim(0, 1.1)
+    axes[0].set_title("Recall")
+    axes[0].tick_params(axis="x", rotation=15)
+    axes[0].grid(True, axis="y", alpha=0.25)
+
+    axes[1].bar(labels, s.heads_fetched, color=colors)
+    for x, v in zip(range(len(s)), s.heads_fetched):
+        axes[1].text(x, v * 1.05, f"{v:.1f}", ha="center", fontsize=10)
+    axes[1].set_ylabel(f"PL fetches per query (probe_base={probe_base})")
+    axes[1].set_yscale("log")
+    axes[1].set_title("I/O cost (PL fetches, log scale)")
+    axes[1].tick_params(axis="x", rotation=15)
+    axes[1].grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / out)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def fig_4way_iso_recall(name: str, title: str, out: str):
+    """At each recall target, how many PL fetches does each strategy need?"""
+    df = load(name)
+    if df.empty:
+        return
+    s = summarise_4way(df)
+    targets = [0.50, 0.75, 0.90, 0.95, 0.99]
+    rows = []
+    for sc in ["none", "adaptive", "bloom", "both"]:
+        sub = s[s.scenario == sc].sort_values("probe_base")
+        for t in targets:
+            hit = sub[sub.recall >= t]
+            if hit.empty:
+                continue
+            r = hit.iloc[0]
+            rows.append({"scenario": sc, "target": t, "fetches": float(r.heads_fetched)})
+    if not rows:
+        return
+    rdf = pd.DataFrame(rows)
+    pivot = rdf.pivot_table(index="target", columns="scenario", values="fetches")
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    width = 0.18
+    xs = list(range(len(pivot)))
+    offsets = [-1.5, -0.5, 0.5, 1.5]
+    for sc, off in zip(["none", "adaptive", "bloom", "both"], offsets):
+        if sc not in pivot.columns:
+            continue
+        vals = pivot[sc].values
+        ax.bar(
+            [x + off * width for x in xs], vals,
+            width=width, color=FOURWAY_COLORS[sc],
+            label=FOURWAY_LABELS[sc],
+        )
+        for i, v in enumerate(vals):
+            if pd.notna(v):
+                ax.text(i + off * width, v * 1.05, f"{v:.0f}", ha="center", fontsize=8)
+    ax.set_yscale("log")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"≥ {t:.2f}" for t in pivot.index])
+    ax.set_xlabel("target recall@10")
+    ax.set_ylabel("PL fetches per query needed (log scale)")
+    ax.set_title(title)
+    ax.legend(loc="upper left")
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / out)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -487,6 +677,43 @@ def main():
 
     # The "Chroma can hit high recall too" plot
     fig_baseline_climbs("09_baseline_climbs.png")
+
+    # 4-way feature stack-up plots: none / adaptive / bloom / both
+    fig_4way_recall_vs_probe(
+        "sweep_4way_n50k_b100.csv",
+        "4-way feature stack-up — recall vs probe_base (1% selectivity, n=50K)",
+        "10_4way_recall_vs_probe_sel1pct.png",
+    )
+    fig_4way_recall_vs_probe(
+        "sweep_4way_n50k_b1000.csv",
+        "4-way feature stack-up — recall vs probe_base (0.1% selectivity, n=50K)",
+        "11_4way_recall_vs_probe_sel01pct.png",
+    )
+    fig_4way_recall_vs_io(
+        "sweep_4way_n50k_b100.csv",
+        "Recall vs I/O Pareto — 4-way comparison (1% selectivity, n=50K)",
+        "12_4way_pareto_sel1pct.png",
+    )
+    fig_4way_recall_vs_io(
+        "sweep_4way_n50k_b1000.csv",
+        "Recall vs I/O Pareto — 4-way comparison (0.1% selectivity, n=50K)",
+        "13_4way_pareto_sel01pct.png",
+    )
+    fig_4way_bars(
+        "sweep_4way_n50k_b100.csv", probe_base=32,
+        title="Single operating point: probe_base=32, 1% selectivity, n=50K",
+        out="14_4way_bars_probe32_sel1pct.png",
+    )
+    fig_4way_bars(
+        "sweep_4way_n50k_b1000.csv", probe_base=32,
+        title="Single operating point: probe_base=32, 0.1% selectivity, n=50K",
+        out="15_4way_bars_probe32_sel01pct.png",
+    )
+    fig_4way_iso_recall(
+        "sweep_4way_n50k_b100.csv",
+        "I/O cost to hit each recall target — 4-way (1% selectivity, n=50K)",
+        "16_4way_iso_recall_io_sel1pct.png",
+    )
 
     print("done.")
 

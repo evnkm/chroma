@@ -119,3 +119,7 @@ harness = false
 [[bench]]
 name = "spann_bloom_sweep"
 harness = false
+
+[[bench]]
+name = "spann_bloom_adaptive_sweep"
+harness = false
