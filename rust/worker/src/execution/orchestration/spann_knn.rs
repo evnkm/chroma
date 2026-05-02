@@ -32,6 +32,41 @@ use crate::execution::operators::{
 
 use super::knn_filter::{KnnError, KnnFilterOutput};
 
+/// Estimate the metadata-filter selectivity (fraction of compacted records that
+/// pass the filter) so SPANN center search can probe more centers when it
+/// matters.
+///
+/// Returns `None` when the filter is absent (`Exclude(empty)`) or when the
+/// collection's compacted size is unknown — in that case the reader falls back
+/// to its configured / size-based nprobe.
+pub(crate) fn estimate_filter_selectivity(
+    compact_offset_ids: &SignedRoaringBitmap,
+    total_records_post_compaction: usize,
+) -> Option<f64> {
+    match compact_offset_ids {
+        SignedRoaringBitmap::Exclude(rbm) if rbm.is_empty() => None,
+        SignedRoaringBitmap::Include(rbm) => {
+            if total_records_post_compaction > 0 {
+                Some(
+                    (rbm.len() as f64 / total_records_post_compaction as f64).clamp(0.0, 1.0),
+                )
+            } else {
+                None
+            }
+        }
+        SignedRoaringBitmap::Exclude(rbm) => {
+            if total_records_post_compaction > 0 {
+                Some(
+                    (1.0 - rbm.len() as f64 / total_records_post_compaction as f64)
+                        .clamp(0.0, 1.0),
+                )
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SpannKnnOrchestrator {
     // Orchestrator parameters
@@ -213,29 +248,10 @@ impl Orchestrator for SpannKnnOrchestrator {
                     .collection
                     .total_records_post_compaction
                     as usize;
-                let filter_selectivity: Option<f64> = match &self
-                    .knn_filter_output
-                    .filter_output
-                    .compact_offset_ids
-                {
-                    SignedRoaringBitmap::Exclude(rbm) if rbm.is_empty() => None,
-                    SignedRoaringBitmap::Include(rbm) => {
-                        if total_records > 0 {
-                            Some((rbm.len() as f64 / total_records as f64).clamp(0.0, 1.0))
-                        } else {
-                            None
-                        }
-                    }
-                    SignedRoaringBitmap::Exclude(rbm) => {
-                        if total_records > 0 {
-                            Some(
-                                (1.0 - rbm.len() as f64 / total_records as f64).clamp(0.0, 1.0),
-                            )
-                        } else {
-                            None
-                        }
-                    }
-                };
+                let filter_selectivity = estimate_filter_selectivity(
+                    &self.knn_filter_output.filter_output.compact_offset_ids,
+                    total_records,
+                );
                 // Spawn the centers search task if reader is found.
                 let head_search_task = wrap(
                     Box::new(self.head_search.clone()),
@@ -411,5 +427,61 @@ impl Handler<TaskResult<KnnMergeOutput, KnnMergeError>> for SpannKnnOrchestrator
         };
 
         self.terminate_with_result(Ok(output.measures), ctx).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_filter_selectivity;
+    use chroma_types::SignedRoaringBitmap;
+    use roaring::RoaringBitmap;
+
+    #[test]
+    fn no_filter_returns_none() {
+        // Exclude(empty) is the canonical "no filter" representation.
+        let bm = SignedRoaringBitmap::Exclude(RoaringBitmap::new());
+        assert_eq!(estimate_filter_selectivity(&bm, 1000), None);
+    }
+
+    #[test]
+    fn unknown_collection_size_returns_none() {
+        let bm = SignedRoaringBitmap::Include(RoaringBitmap::from_iter([1u32, 2, 3]));
+        assert_eq!(estimate_filter_selectivity(&bm, 0), None);
+    }
+
+    #[test]
+    fn include_yields_count_over_total() {
+        // 100 records included out of 10 000 = 0.01.
+        let mut rbm = RoaringBitmap::new();
+        for i in 0..100u32 {
+            rbm.insert(i);
+        }
+        let bm = SignedRoaringBitmap::Include(rbm);
+        let sel = estimate_filter_selectivity(&bm, 10_000).unwrap();
+        assert!((sel - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exclude_yields_complement() {
+        // Excluding 9 000 of 10 000 leaves 0.10 passing.
+        let mut rbm = RoaringBitmap::new();
+        for i in 0..9_000u32 {
+            rbm.insert(i);
+        }
+        let bm = SignedRoaringBitmap::Exclude(rbm);
+        let sel = estimate_filter_selectivity(&bm, 10_000).unwrap();
+        assert!((sel - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn over_unit_clamps() {
+        // Include rbm larger than collection (shouldn't happen but defensive).
+        let mut rbm = RoaringBitmap::new();
+        for i in 0..1_500u32 {
+            rbm.insert(i);
+        }
+        let bm = SignedRoaringBitmap::Include(rbm);
+        let sel = estimate_filter_selectivity(&bm, 1_000).unwrap();
+        assert_eq!(sel, 1.0);
     }
 }

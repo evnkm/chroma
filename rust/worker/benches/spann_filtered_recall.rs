@@ -18,9 +18,30 @@
 //                                     so the reader internally calls
 //                                     `filter_aware_nprobe`. Validates the
 //                                     committed Rust change end-to-end.
+//   BENCH_STRATEGY=topup           => start at base_nprobe; if returned < k,
+//                                     re-issue rng_query with nprobe += base
+//                                     until either k results or
+//                                     nprobe >= base * max_factor. Sums latency
+//                                     across iterations.
 //
-// All three boost formulas are identical: clamp(base / max(sel, eps), base,
-// base * max_factor). Numbers should match within HNSW determinism.
+// adaptive and reader_adaptive use the same clamp formula:
+//   clamp(base / max(sel, eps), base, base * max_factor).
+//
+// Filter shapes (BENCH_FILTER_SHAPE):
+//   bernoulli   (default) — each record passes the filter independently with
+//                           probability `sel`. Uniform random.
+//   categorical            — bucket = hash(id) mod ceil(1/sel); bucket 0 passes.
+//                           Bucket boundaries don't follow the vector-space
+//                           geometry. Closer to "category=foo" filters in real
+//                           workloads.
+//   range                  — sort records by L2 norm of embedding, take a
+//                           contiguous slice of size sel*N. Correlated with
+//                           vector geometry; should be where adaptive earns the
+//                           most.
+//   adversarial            — exclude the true unfiltered top-50 nearest
+//                           neighbors of the query, then sample sel*N from the
+//                           rest. Probing more centers can't recover the banned
+//                           records — this is the failure-mode benchmark.
 //
 // Output CSV schema (shared across the project):
 //   dataset, n_records, dim, query_id, k, selectivity, strategy,
@@ -116,12 +137,90 @@ fn main() {
     });
 }
 
+fn shape_seed_offset(shape: &str) -> u64 {
+    match shape {
+        "bernoulli" => 0,
+        "categorical" => 0xCAFE_BABE,
+        "range" => 0xBEEF_F00D,
+        "adversarial" => 0xDEAD_BEEF,
+        _ => 0,
+    }
+}
+
+fn generate_filter(
+    shape: &str,
+    q_idx: usize,
+    sel: f64,
+    records: &[(u32, Vec<f32>)],
+    query: &[f32],
+    distance_function: &DistanceFunction,
+) -> RoaringBitmap {
+    let filter_seed = ((q_idx as u64).wrapping_shl(32))
+        ^ ((sel * 1_000_000.0) as u64)
+        ^ shape_seed_offset(shape);
+    let mut allowed = RoaringBitmap::new();
+    match shape {
+        "bernoulli" => {
+            let mut rng = StdRng::seed_from_u64(filter_seed);
+            for r in records {
+                if rng.gen::<f64>() < sel {
+                    allowed.insert(r.0);
+                }
+            }
+        }
+        "categorical" => {
+            let n_buckets = ((1.0 / sel).max(1.0)).round() as u64;
+            for r in records {
+                // Mix the offset id with a fixed multiplier so contiguous ids
+                // don't all land in the same bucket.
+                let bucket = (r.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % n_buckets;
+                if bucket == 0 {
+                    allowed.insert(r.0);
+                }
+            }
+        }
+        "range" => {
+            let mut by_norm: Vec<(u32, f32)> = records
+                .iter()
+                .map(|(id, emb)| (*id, emb.iter().map(|x| x * x).sum::<f32>().sqrt()))
+                .collect();
+            by_norm.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let n = records.len();
+            let take = ((sel * n as f64).round() as usize).max(1).min(n);
+            let start = (filter_seed as usize) % (n - take + 1).max(1);
+            for i in start..(start + take).min(n) {
+                allowed.insert(by_norm[i].0);
+            }
+        }
+        "adversarial" => {
+            let mut all: Vec<(u32, f32)> = records
+                .iter()
+                .map(|(id, emb)| (*id, distance_function.distance(emb, query)))
+                .collect();
+            all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let banned: HashSet<u32> = all.iter().take(50).map(|(id, _)| *id).collect();
+            let mut rng = StdRng::seed_from_u64(filter_seed);
+            for r in records {
+                if !banned.contains(&r.0) && rng.gen::<f64>() < sel {
+                    allowed.insert(r.0);
+                }
+            }
+        }
+        _ => panic!("Unknown BENCH_FILTER_SHAPE: {}", shape),
+    }
+    if allowed.is_empty() && sel > 0.0 {
+        allowed.insert(records[0].0);
+    }
+    allowed
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n_records: usize = env_parse("BENCH_N_RECORDS", 10_000usize);
     let n_queries: usize = env_parse("BENCH_N_QUERIES", 50usize);
     let k: usize = env_parse("BENCH_K", 10usize);
     let dataset = env_string("BENCH_DATASET", "sift1m");
     let strategy = env_string("BENCH_STRATEGY", "fixed");
+    let filter_shape = env_string("BENCH_FILTER_SHAPE", "bernoulli");
     let max_factor: f64 = env_parse("BENCH_MAX_FACTOR", 8.0f64);
     let epsilon: f64 = env_parse("BENCH_EPSILON", 0.001f64);
     let selectivities = env_vec_f64(
@@ -140,8 +239,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!(
-        "[bench] dataset={} strategy={} n_records={} n_queries={} k={}",
-        dataset, strategy, n_records, n_queries, k
+        "[bench] dataset={} strategy={} n_records={} n_queries={} k={} filter_shape={}",
+        dataset, strategy, n_records, n_queries, k, filter_shape
     );
     eprintln!(
         "[bench] selectivities={:?} nprobes={:?} max_factor={} eps={}",
@@ -265,24 +364,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(File::create(&output)?);
     writeln!(
         out,
-        "dataset,n_records,dim,query_id,k,selectivity,strategy,base_nprobe,nprobe_used,returned_count,recall_at_k,latency_ms,centers,candidates_before_filter,candidates_after_filter"
+        "dataset,n_records,dim,query_id,k,selectivity,strategy,base_nprobe,nprobe_used,returned_count,recall_at_k,latency_ms,t_centers_ms,t_fetch_pl_ms,t_bf_pl_ms,t_merge_ms,centers,candidates_before_filter,candidates_after_filter,filter_shape,max_factor,epsilon"
     )?;
 
     for (q_idx, query) in queries.iter().enumerate() {
         for &sel in &selectivities {
-            // Deterministic per-(query, selectivity) filter.
-            let filter_seed =
-                ((q_idx as u64).wrapping_shl(32)) ^ ((sel * 1_000_000.0) as u64);
-            let mut rng_filter = StdRng::seed_from_u64(filter_seed);
-            let mut allowed = RoaringBitmap::new();
-            for r in &records {
-                if rng_filter.gen::<f64>() < sel {
-                    allowed.insert(r.0);
-                }
-            }
-            if allowed.is_empty() && sel > 0.0 {
-                allowed.insert(records[0].0);
-            }
+            // Deterministic per-(query, sel, shape) filter.
+            let allowed = generate_filter(
+                &filter_shape,
+                q_idx,
+                sel,
+                &records,
+                query,
+                &distance_function,
+            );
             let allowed_set: HashSet<u32> = allowed.iter().collect();
             let signed = SignedRoaringBitmap::Include(allowed.clone());
 
@@ -300,7 +395,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             for &base_np in &base_nprobes {
                 let reader = &readers[&base_np];
-                let nprobe_used: usize = match strategy.as_str() {
+                let initial_nprobe: usize = match strategy.as_str() {
                     "adaptive" | "reader_adaptive" => {
                         let raw = base_np as f64 / sel.max(epsilon);
                         raw.clamp(base_np as f64, base_np as f64 * max_factor)
@@ -308,66 +403,104 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     _ => base_np,
                 };
+                let cap_nprobe = (base_np as f64 * max_factor).round() as usize;
 
-                let t0 = Instant::now();
-                let (head_ids, _, _) = if strategy == "reader_adaptive" {
-                    // Exercise the production code path: the reader computes
-                    // nprobe internally via `filter_aware_nprobe(base, Some(sel))`.
-                    reader
-                        .rng_query(query, n_records, k, Some(sel))
-                        .await
-                        .expect("reader.rng_query")
-                } else {
-                    rng_query(
-                        query,
-                        reader.hnsw_index.clone(),
-                        nprobe_used,
-                        None,
-                        params.search_rng_epsilon,
-                        params.search_rng_factor,
-                        distance_function.clone(),
-                        false,
-                    )
-                    .await
-                    .expect("rng_query")
-                };
-
-                let mut batch = Vec::with_capacity(head_ids.len());
+                // For all strategies except `topup`, the loop runs exactly once.
+                // For `topup`, retry with a larger nprobe (incrementing by
+                // `base_np`) until either `returned >= k` or we hit the cap.
+                let mut nprobe_attempt = initial_nprobe;
+                let mut t_centers_ms: f64 = 0.0;
+                let mut t_fetch_pl_ms: f64 = 0.0;
+                let mut t_bf_pl_ms: f64 = 0.0;
+                let mut t_merge_ms: f64 = 0.0;
+                let mut last_head_count: usize = 0;
                 let mut cands_before: usize = 0;
                 let mut cands_after: usize = 0;
-                for h in &head_ids {
-                    let pl = reader
-                        .fetch_posting_list(*h as u32)
+                let mut last_returned: usize = 0;
+                let mut last_result_ids: HashSet<u32> = HashSet::new();
+                let mut nprobe_used: usize = nprobe_attempt;
+
+                let t_total_start = Instant::now();
+                loop {
+                    let t_centers_start = Instant::now();
+                    let (head_ids, _, _) = if strategy == "reader_adaptive" {
+                        reader
+                            .rng_query(query, n_records, k, Some(sel))
+                            .await
+                            .expect("reader.rng_query")
+                    } else {
+                        rng_query(
+                            query,
+                            reader.hnsw_index.clone(),
+                            nprobe_attempt,
+                            None,
+                            params.search_rng_epsilon,
+                            params.search_rng_factor,
+                            distance_function.clone(),
+                            false,
+                        )
                         .await
-                        .expect("fetch_pl");
-                    cands_before += pl.len();
-                    cands_after += pl
-                        .iter()
-                        .filter(|p| allowed_set.contains(&p.doc_offset_id))
-                        .count();
-                    let bf_input = SpannBfPlInput {
-                        posting_list: pl,
-                        k,
-                        filter: signed.clone(),
-                        distance_function: distance_function.clone(),
-                        query: query.clone(),
+                        .expect("rng_query")
                     };
-                    let bf_out = SpannBfPlOperator::new()
-                        .run(&bf_input)
+                    t_centers_ms += t_centers_start.elapsed().as_secs_f64() * 1000.0;
+
+                    let mut batch = Vec::with_capacity(head_ids.len());
+                    let mut cb_iter = 0usize;
+                    let mut ca_iter = 0usize;
+                    for h in &head_ids {
+                        let t_fetch_start = Instant::now();
+                        let pl = reader
+                            .fetch_posting_list(*h as u32)
+                            .await
+                            .expect("fetch_pl");
+                        t_fetch_pl_ms += t_fetch_start.elapsed().as_secs_f64() * 1000.0;
+                        cb_iter += pl.len();
+                        ca_iter += pl
+                            .iter()
+                            .filter(|p| allowed_set.contains(&p.doc_offset_id))
+                            .count();
+                        let bf_input = SpannBfPlInput {
+                            posting_list: pl,
+                            k,
+                            filter: signed.clone(),
+                            distance_function: distance_function.clone(),
+                            query: query.clone(),
+                        };
+                        let t_bf_start = Instant::now();
+                        let bf_out = SpannBfPlOperator::new()
+                            .run(&bf_input)
+                            .await
+                            .expect("bf_pl");
+                        t_bf_pl_ms += t_bf_start.elapsed().as_secs_f64() * 1000.0;
+                        batch.push(bf_out.records);
+                    }
+                    let t_merge_start = Instant::now();
+                    let merged = Merge { k: k as u32 }
+                        .run(&KnnMergeInput {
+                            batch_measures: batch,
+                        })
                         .await
-                        .expect("bf_pl");
-                    batch.push(bf_out.records);
+                        .expect("merge");
+                    t_merge_ms += t_merge_start.elapsed().as_secs_f64() * 1000.0;
+
+                    last_head_count = head_ids.len();
+                    cands_before = cb_iter;
+                    cands_after = ca_iter;
+                    last_returned = merged.measures.len();
+                    last_result_ids = merged.measures.iter().map(|r| r.offset_id).collect();
+                    nprobe_used = nprobe_attempt;
+
+                    if strategy != "topup" {
+                        break;
+                    }
+                    if last_returned >= k || nprobe_attempt >= cap_nprobe {
+                        break;
+                    }
+                    nprobe_attempt = (nprobe_attempt + base_np).min(cap_nprobe);
                 }
-                let merged = Merge { k: k as u32 }
-                    .run(&KnnMergeInput {
-                        batch_measures: batch,
-                    })
-                    .await
-                    .expect("merge");
-                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                let returned_count = merged.measures.len();
-                let result_ids: HashSet<u32> =
-                    merged.measures.iter().map(|r| r.offset_id).collect();
+                let elapsed_ms = t_total_start.elapsed().as_secs_f64() * 1000.0;
+                let returned_count = last_returned;
+                let result_ids = last_result_ids;
                 let intersection = gt_top.iter().filter(|id| result_ids.contains(id)).count();
                 // Recall@k normalised against the smaller of (k, available filtered records).
                 let denom = gt_n.min(k);
@@ -379,7 +512,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 writeln!(
                     out,
-                    "{},{},{},{},{},{:.6},{},{},{},{},{:.6},{:.3},{},{},{}",
+                    "{},{},{},{},{},{:.6},{},{},{},{},{:.6},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{:.4},{:.6}",
                     dataset,
                     n_records,
                     dim,
@@ -392,9 +525,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     returned_count,
                     recall,
                     elapsed_ms,
-                    head_ids.len(),
+                    t_centers_ms,
+                    t_fetch_pl_ms,
+                    t_bf_pl_ms,
+                    t_merge_ms,
+                    last_head_count,
                     cands_before,
-                    cands_after
+                    cands_after,
+                    filter_shape,
+                    max_factor,
+                    epsilon
                 )?;
             }
         }
