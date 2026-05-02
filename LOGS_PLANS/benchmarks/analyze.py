@@ -29,25 +29,32 @@ def load(csv_paths):
     return pd.concat(frames, ignore_index=True)
 
 
+PHASE_COLS = ["t_centers_ms", "t_fetch_pl_ms", "t_bf_pl_ms", "t_merge_ms"]
+
+
 def aggregate(df):
     group_cols = ["dataset", "n_records", "k", "strategy", "base_nprobe", "selectivity"]
-    agg = (
-        df.groupby(group_cols)
-        .agg(
-            recall_mean=("recall_at_k", "mean"),
-            recall_p10=("recall_at_k", lambda s: s.quantile(0.10)),
-            recall_p50=("recall_at_k", "median"),
-            latency_mean=("latency_ms", "mean"),
-            latency_p50=("latency_ms", "median"),
-            latency_p95=("latency_ms", lambda s: s.quantile(0.95)),
-            returned_mean=("returned_count", "mean"),
-            nprobe_used_mean=("nprobe_used", "mean"),
-            cands_before_mean=("candidates_before_filter", "mean"),
-            cands_after_mean=("candidates_after_filter", "mean"),
-            n=("recall_at_k", "size"),
-        )
-        .reset_index()
+    agg_kwargs = dict(
+        recall_mean=("recall_at_k", "mean"),
+        recall_p10=("recall_at_k", lambda s: s.quantile(0.10)),
+        recall_p25=("recall_at_k", lambda s: s.quantile(0.25)),
+        recall_p50=("recall_at_k", "median"),
+        latency_mean=("latency_ms", "mean"),
+        latency_p50=("latency_ms", "median"),
+        latency_p90=("latency_ms", lambda s: s.quantile(0.90)),
+        latency_p95=("latency_ms", lambda s: s.quantile(0.95)),
+        latency_p99=("latency_ms", lambda s: s.quantile(0.99)),
+        returned_mean=("returned_count", "mean"),
+        nprobe_used_mean=("nprobe_used", "mean"),
+        cands_before_mean=("candidates_before_filter", "mean"),
+        cands_after_mean=("candidates_after_filter", "mean"),
+        n=("recall_at_k", "size"),
     )
+    # Per-phase mean timings if present in the CSV (D1 instrumentation).
+    for col in PHASE_COLS:
+        if col in df.columns:
+            agg_kwargs[f"{col}_mean"] = (col, "mean")
+    agg = df.groupby(group_cols).agg(**agg_kwargs).reset_index()
     return agg
 
 
@@ -57,11 +64,15 @@ def plot_curves(agg, out_dir, label):
 
     metrics = [
         ("recall_mean", "recall@k (mean)", "recall_vs_selectivity.png"),
+        ("recall_p10", "recall@k (p10)", "recall_p10_vs_selectivity.png"),
         ("latency_mean", "latency_ms (mean)", "latency_vs_selectivity.png"),
+        ("latency_p95", "latency_ms (p95)", "latency_p95_vs_selectivity.png"),
         ("returned_mean", "returned_count (mean)", "returned_vs_selectivity.png"),
     ]
 
     for metric, ylabel, fname in metrics:
+        if metric not in agg.columns:
+            continue
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for (strat, np_), sub in agg.groupby(["strategy", "base_nprobe"]):
             sub = sub.sort_values("selectivity")
@@ -82,6 +93,32 @@ def plot_curves(agg, out_dir, label):
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
         print(f"wrote {out_path}")
+
+    # Per-phase stacked-bar plot if instrumentation columns are present.
+    phase_cols = [f"{c}_mean" for c in PHASE_COLS if f"{c}_mean" in agg.columns]
+    if phase_cols:
+        for strat in agg["strategy"].unique():
+            sub = agg[agg["strategy"] == strat].copy()
+            sub = sub.sort_values(["base_nprobe", "selectivity"])
+            sub["xkey"] = sub.apply(
+                lambda r: f"np={int(r['base_nprobe'])}\nsel={r['selectivity']:g}",
+                axis=1,
+            )
+            fig, ax = plt.subplots(figsize=(max(8, 0.5 * len(sub)), 4.5))
+            bottoms = [0.0] * len(sub)
+            for col in phase_cols:
+                vals = sub[col].fillna(0).tolist()
+                ax.bar(sub["xkey"], vals, bottom=bottoms, label=col.replace("_mean", ""))
+                bottoms = [b + v for b, v in zip(bottoms, vals)]
+            ax.set_ylabel("latency_ms (mean)")
+            ax.set_title(f"{label}: per-phase share — strategy={strat}")
+            ax.legend(loc="best", fontsize=8)
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=6)
+            fig.tight_layout()
+            out_path = out_dir / f"phase_share_{strat}.png"
+            fig.savefig(out_path, dpi=120)
+            plt.close(fig)
+            print(f"wrote {out_path}")
 
 
 def write_summary_md(agg, out_dir, label):
