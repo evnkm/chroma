@@ -686,6 +686,8 @@ pub fn internal_spann_configuration_strategy() -> impl Strategy<Value = Internal
                 ef_construction,
                 ef_search,
                 max_neighbors,
+                adaptive_nprobe_eps: crate::default_adaptive_nprobe_eps(),
+                adaptive_nprobe_max_factor: crate::default_adaptive_nprobe_max_factor(),
             },
         )
 }

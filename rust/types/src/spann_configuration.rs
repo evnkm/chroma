@@ -16,6 +16,20 @@ pub fn default_search_rng_epsilon() -> f32 {
     10.0
 }
 
+/// Selectivity floor used by the filter-aware adaptive nprobe boost.
+/// Selectivities below this are treated as if they equal this value, so a
+/// near-zero filter doesn't blow up the boost ratio.
+pub fn default_adaptive_nprobe_eps() -> f64 {
+    0.001
+}
+
+/// Maximum multiplier the adaptive nprobe boost can apply on top of the
+/// configured `search_nprobe`. With `eps=0.001` and `max_factor=8.0`, the
+/// cap is reached at `selectivity ≈ 0.125` and below.
+pub fn default_adaptive_nprobe_max_factor() -> f64 {
+    8.0
+}
+
 pub fn default_write_nprobe() -> u32 {
     32
 }
@@ -143,6 +157,12 @@ pub struct InternalSpannConfiguration {
     #[serde(default = "default_m_spann")]
     #[validate(range(max = 64))]
     pub max_neighbors: usize,
+    /// Selectivity floor for the filter-aware adaptive nprobe boost.
+    #[serde(default = "default_adaptive_nprobe_eps")]
+    pub adaptive_nprobe_eps: f64,
+    /// Multiplicative cap for the filter-aware adaptive nprobe boost.
+    #[serde(default = "default_adaptive_nprobe_max_factor")]
+    pub adaptive_nprobe_max_factor: f64,
 }
 
 impl Default for InternalSpannConfiguration {
@@ -187,6 +207,8 @@ impl From<(Option<&Space>, &SpannIndexConfig)> for InternalSpannConfiguration {
             ef_search: config.ef_search.unwrap_or(default_search_ef_spann()),
             max_neighbors: config.max_neighbors.unwrap_or(default_m_spann()),
             space: space.unwrap_or(&default_space()).clone(),
+            adaptive_nprobe_eps: default_adaptive_nprobe_eps(),
+            adaptive_nprobe_max_factor: default_adaptive_nprobe_max_factor(),
         }
     }
 }
@@ -238,6 +260,8 @@ impl From<SpannConfiguration> for InternalSpannConfiguration {
                 .unwrap_or(default_reassign_neighbor_count()),
             split_threshold: config.split_threshold.unwrap_or(default_split_threshold()),
             merge_threshold: config.merge_threshold.unwrap_or(default_merge_threshold()),
+            adaptive_nprobe_eps: default_adaptive_nprobe_eps(),
+            adaptive_nprobe_max_factor: default_adaptive_nprobe_max_factor(),
             ..Default::default()
         }
     }

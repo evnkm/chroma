@@ -2652,26 +2652,42 @@ pub struct SpannPosting {
     pub doc_embedding: Vec<f32>,
 }
 
-/// Selectivity below which `filter_aware_nprobe` is treated as if the filter
-/// matches at most this fraction of records. Prevents division blow-up.
+/// Default selectivity floor used by `filter_aware_nprobe`. Selectivities
+/// below this are treated as if they equal this value, so a near-zero filter
+/// doesn't blow up the boost ratio. Mirrored in
+/// `chroma_types::default_adaptive_nprobe_eps` and ships per-collection via
+/// `InternalSpannConfiguration::adaptive_nprobe_eps`.
 pub const ADAPTIVE_NPROBE_EPSILON: f64 = 0.001;
 
-/// Maximum multiplicative boost over `base_nprobe` allowed when the filter is
-/// very selective. With epsilon=0.001 and max_factor=8, the cap is reached at
-/// sel ≈ 0.125 and below.
+/// Default maximum multiplicative boost. Mirrored in
+/// `chroma_types::default_adaptive_nprobe_max_factor` and ships per-collection
+/// via `InternalSpannConfiguration::adaptive_nprobe_max_factor`.
 pub const ADAPTIVE_NPROBE_MAX_FACTOR: f64 = 8.0;
 
 /// Filter-selectivity-aware boost on top of a size-based nprobe.
 /// Returns `base_nprobe` unchanged when there is no filter (None) or when
 /// the filter passes everything (sel = 1.0).
 pub fn filter_aware_nprobe(base_nprobe: u32, filter_selectivity: Option<f64>) -> u32 {
+    filter_aware_nprobe_with(
+        base_nprobe,
+        filter_selectivity,
+        ADAPTIVE_NPROBE_EPSILON,
+        ADAPTIVE_NPROBE_MAX_FACTOR,
+    )
+}
+
+/// Variant of `filter_aware_nprobe` that takes the tuning constants
+/// explicitly, so callers can plumb per-collection overrides.
+pub fn filter_aware_nprobe_with(
+    base_nprobe: u32,
+    filter_selectivity: Option<f64>,
+    eps: f64,
+    max_factor: f64,
+) -> u32 {
     if let Some(sel) = filter_selectivity {
-        let raw = base_nprobe as f64 / sel.max(ADAPTIVE_NPROBE_EPSILON);
-        raw.clamp(
-            base_nprobe as f64,
-            base_nprobe as f64 * ADAPTIVE_NPROBE_MAX_FACTOR,
-        )
-        .round() as u32
+        let raw = base_nprobe as f64 / sel.max(eps);
+        raw.clamp(base_nprobe as f64, base_nprobe as f64 * max_factor)
+            .round() as u32
     } else {
         base_nprobe
     }
@@ -2864,8 +2880,14 @@ impl<'me> SpannIndexReader<'me> {
         // Filter-aware boost: probe more centers when the metadata filter is
         // restrictive so enough candidates survive the bitmask. Composes with
         // the size-based adaptation above. No-op when filter_selectivity is
-        // None (no filter) or 1.0 (filter passes everything).
-        let filter_aware = filter_aware_nprobe(size_based, filter_selectivity);
+        // None (no filter) or 1.0 (filter passes everything). Tuning constants
+        // are read from `self.params` so per-collection overrides take effect.
+        let filter_aware = filter_aware_nprobe_with(
+            size_based,
+            filter_selectivity,
+            self.params.adaptive_nprobe_eps,
+            self.params.adaptive_nprobe_max_factor,
+        );
 
         filter_aware.max(min_nprobe)
     }

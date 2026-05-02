@@ -4564,6 +4564,8 @@ mod tests {
                 ef_search: 60,
                 max_neighbors: 24,
                 space: Space::Cosine,
+                adaptive_nprobe_eps: 0.001,
+                adaptive_nprobe_max_factor: 8.0,
             }),
             embedding_function: None,
         };
@@ -4677,6 +4679,8 @@ mod tests {
                 ef_search: 60,
                 max_neighbors: 24,
                 space: Space::Cosine,
+                adaptive_nprobe_eps: 0.001,
+                adaptive_nprobe_max_factor: 8.0,
             }),
             embedding_function: None,
         };
@@ -4896,6 +4900,8 @@ mod tests {
                 ef_search: 60,
                 max_neighbors: 24,
                 space: Space::Cosine,
+                adaptive_nprobe_eps: 0.001,
+                adaptive_nprobe_max_factor: 8.0,
             }),
             embedding_function: None,
         };
