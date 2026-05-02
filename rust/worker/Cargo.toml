@@ -115,3 +115,7 @@ harness = false
 [[bench]]
 name = "spann_bloom_ablation"
 harness = false
+
+[[bench]]
+name = "spann_bloom_sweep"
+harness = false
