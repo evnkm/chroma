@@ -361,6 +361,68 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let distance_function: DistanceFunction = params.clone().space.into();
 
+    // D11: per-centroid metadata-stats prototype.
+    // Offline phase: enumerate every centroid in the index and remember the
+    // set of `doc_offset_id`s on its posting list as a `RoaringBitmap`. At
+    // query time we intersect the filter with each centroid's bitmap to
+    // predict hit count without re-scanning the posting list. In production
+    // this would be persisted alongside the centroid (Hammad's workstream);
+    // for the prototype we compute it once after the index is built.
+    //
+    // Two query-time variants:
+    //   `metadata_stats`        — pure: rank ALL centroids by predicted hits,
+    //                             ignore distance. Good baseline for
+    //                             "smarter probing" in isolation.
+    //   `metadata_stats_hybrid` — distance + hits: rank top-(`hybrid_pool *
+    //                             nprobe`) by distance, then within that pool
+    //                             rank by predicted hits and pick top-`nprobe`.
+    //                             What a production-y "filter-aware probing"
+    //                             would actually look like.
+    let hybrid_pool: usize = env_parse("BENCH_HYBRID_POOL", 4usize);
+    let needs_centroid_pls =
+        strategy == "metadata_stats" || strategy == "metadata_stats_hybrid";
+    let centroid_pls: HashMap<u32, RoaringBitmap> = if needs_centroid_pls {
+        let any_reader = readers
+            .values()
+            .next()
+            .expect("at least one reader");
+        // Trick to enumerate every centroid: ask hnsw for a huge nprobe.
+        // The hnsw layer just clamps to the actual number of centers.
+        let dummy = vec![0.0f32; dim];
+        let (all_centers, _, _) = rng_query(
+            &dummy,
+            any_reader.hnsw_index.clone(),
+            100_000,
+            None,
+            params.search_rng_epsilon,
+            params.search_rng_factor,
+            distance_function.clone(),
+            false,
+        )
+        .await
+        .expect("enumerate centers");
+        eprintln!(
+            "[bench] metadata_stats: enumerated {} centers, fetching posting lists for histogram...",
+            all_centers.len()
+        );
+        let mut h: HashMap<u32, RoaringBitmap> = HashMap::with_capacity(all_centers.len());
+        for &cid in &all_centers {
+            let pl = any_reader
+                .fetch_posting_list(cid as u32)
+                .await
+                .expect("fetch_pl for histogram");
+            let mut bm = RoaringBitmap::new();
+            for p in &pl {
+                bm.insert(p.doc_offset_id);
+            }
+            h.insert(cid as u32, bm);
+        }
+        eprintln!("[bench] metadata_stats: histogram ready ({} centers)", h.len());
+        h
+    } else {
+        HashMap::new()
+    };
+
     let mut out = BufWriter::new(File::create(&output)?);
     writeln!(
         out,
@@ -423,13 +485,66 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let t_total_start = Instant::now();
                 loop {
                     let t_centers_start = Instant::now();
-                    let (head_ids, _, _) = if strategy == "reader_adaptive" {
-                        reader
+                    let head_ids: Vec<usize> = if strategy == "metadata_stats" {
+                        // Pure: rank ALL centroids by predicted filter hits
+                        // and probe the top-`nprobe_attempt` ones. No call
+                        // into the hnsw distance ranker — included as the
+                        // strawman that demonstrates abandoning distance
+                        // hurts recall.
+                        let mut scored: Vec<(u32, u64)> = centroid_pls
+                            .iter()
+                            .map(|(cid, pl_bm)| (*cid, (pl_bm & &allowed).len()))
+                            .collect();
+                        scored.sort_by(|a, b| b.1.cmp(&a.1));
+                        scored
+                            .into_iter()
+                            .take(nprobe_attempt)
+                            .map(|(cid, _)| cid as usize)
+                            .collect()
+                    } else if strategy == "metadata_stats_hybrid" {
+                        // Hybrid: ask hnsw for `hybrid_pool * nprobe` nearest
+                        // centers, then rerank within that pool by predicted
+                        // filter hits and pick top-`nprobe`. Keeps distance
+                        // signal but lets the metadata histogram break ties.
+                        let pool_size = (hybrid_pool * nprobe_attempt).max(nprobe_attempt);
+                        let (pool, _, _) = rng_query(
+                            query,
+                            reader.hnsw_index.clone(),
+                            pool_size,
+                            None,
+                            params.search_rng_epsilon,
+                            params.search_rng_factor,
+                            distance_function.clone(),
+                            false,
+                        )
+                        .await
+                        .expect("rng_query (hybrid pool)");
+                        let mut scored: Vec<(usize, u64)> = pool
+                            .iter()
+                            .map(|cid| {
+                                let bm = centroid_pls
+                                    .get(&(*cid as u32))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                (*cid, (&bm & &allowed).len())
+                            })
+                            .collect();
+                        // Stable sort on hit count (desc) preserves distance
+                        // order on ties so closer centers win when hits tie.
+                        scored.sort_by(|a, b| b.1.cmp(&a.1));
+                        scored
+                            .into_iter()
+                            .take(nprobe_attempt)
+                            .map(|(cid, _)| cid)
+                            .collect()
+                    } else if strategy == "reader_adaptive" {
+                        let (h, _, _) = reader
                             .rng_query(query, n_records, k, Some(sel))
                             .await
-                            .expect("reader.rng_query")
+                            .expect("reader.rng_query");
+                        h
                     } else {
-                        rng_query(
+                        let (h, _, _) = rng_query(
                             query,
                             reader.hnsw_index.clone(),
                             nprobe_attempt,
@@ -440,7 +555,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             false,
                         )
                         .await
-                        .expect("rng_query")
+                        .expect("rng_query");
+                        h
                     };
                     t_centers_ms += t_centers_start.elapsed().as_secs_f64() * 1000.0;
 
