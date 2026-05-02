@@ -107,6 +107,7 @@ fn add_to_index_and_get_reader<'a>(
             pl_block_size,
             SpannMetrics::default(),
             None,
+            None,
         )
         .await
         .expect("Error creating spann index writer");
@@ -156,6 +157,7 @@ fn add_to_index_and_get_reader<'a>(
                 prefix_path,
                 true,
                 params,
+                None,
             ))
             .await
             .expect("Error creating spann index reader"),

@@ -15,6 +15,7 @@ use chroma_cache::AysncPartitionedMutex;
 use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
 use chroma_error::{ChromaError, ErrorCodes};
+use chroma_storage::{admissioncontrolleds3::StorageRequestPriority, GetOptions, Storage};
 use chroma_tracing::util::Stopwatch;
 use chroma_types::{Cmek, CollectionUuid, InternalSpannConfiguration, SpannPostingList};
 use futures::future;
@@ -33,6 +34,10 @@ use crate::{
         HnswIndexFlusher, HnswIndexProvider, HnswIndexProviderCreateError,
         HnswIndexProviderFlushError, HnswIndexProviderForkError, HnswIndexProviderOpenError,
         HnswIndexRef,
+    },
+    spann::head_bloom::{
+        self, EqualityTokens, HeadBloom, HeadBloomBlob, HeadBloomBlobFlusher, HeadBloomCache,
+        HeadBloomReadConfig, HeadBloomWriteConfig,
     },
     spann::utils::cluster,
     IndexUuid,
@@ -328,6 +333,10 @@ pub struct SpannIndexWriter {
     metrics: SpannMetrics,
     stats: WriteStats,
     cmek: Option<Cmek>,
+    pub head_bloom_enabled: bool,
+    pub head_bloom_cache: HeadBloomCache,
+    pub head_bloom_doc_tokens_cache_enabled: bool,
+    pub head_bloom_commit_rebuild_enabled: bool,
 }
 
 #[derive(Error, Debug)]
@@ -390,6 +399,8 @@ pub enum SpannIndexWriterError {
     HnswIndexFlushError(#[source] HnswIndexProviderFlushError),
     #[error("Error kmeans clustering {0}")]
     KMeansClusteringError(#[from] KMeansError),
+    #[error("Error saving head bloom filter blob: {0}")]
+    HeadBloomBlobSaveError(String),
 }
 
 impl ChromaError for SpannIndexWriterError {
@@ -424,6 +435,7 @@ impl ChromaError for SpannIndexWriterError {
             Self::VersionsMapWriterCreateError(e) => e.code(),
             Self::MaxHeadIdWriterCreateError(e) => e.code(),
             Self::KMeansClusteringError(e) => e.code(),
+            Self::HeadBloomBlobSaveError(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -453,6 +465,10 @@ impl SpannIndexWriter {
         metrics: SpannMetrics,
         prefix_path: String,
         cmek: Option<Cmek>,
+        head_bloom_enabled: bool,
+        head_bloom_cache: HeadBloomCache,
+        head_bloom_doc_tokens_cache_enabled: bool,
+        head_bloom_commit_rebuild_enabled: bool,
     ) -> Self {
         SpannIndexWriter {
             hnsw_index,
@@ -471,6 +487,10 @@ impl SpannIndexWriter {
             stats: WriteStats::default(),
             prefix_path,
             cmek,
+            head_bloom_enabled,
+            head_bloom_cache,
+            head_bloom_doc_tokens_cache_enabled,
+            head_bloom_commit_rebuild_enabled,
         }
     }
 
@@ -644,6 +664,7 @@ impl SpannIndexWriter {
         pl_block_size: usize,
         metrics: SpannMetrics,
         cmek: Option<Cmek>,
+        head_bloom_config: Option<HeadBloomWriteConfig<'_>>,
     ) -> Result<Self, SpannIndexWriterError> {
         let distance_function = DistanceFunction::from(params.space.clone());
         // Create the HNSW index.
@@ -724,6 +745,47 @@ impl SpannIndexWriter {
             }
             None => 1,
         };
+        let (
+            head_bloom_enabled,
+            head_bloom_cache,
+            head_bloom_doc_tokens_cache_enabled,
+            head_bloom_commit_rebuild_enabled,
+        ) = match head_bloom_config {
+            Some(cfg) => {
+                // commit_rebuild needs doc_tokens populated to rebuild each
+                // head's bloom from PL × doc_tokens at commit time, even if
+                // Option 1's append-time mechanic is off. Always allocate the
+                // map when either Option 1 or Option 2 is on.
+                let need_doc_tokens =
+                    cfg.doc_tokens_cache_enabled || cfg.commit_rebuild_enabled;
+                let cache = if need_doc_tokens {
+                    HeadBloomCache::new_with_doc_tokens(cfg.capacity_per_head)
+                } else {
+                    HeadBloomCache::new(cfg.capacity_per_head)
+                };
+                if let Some(blob_path) = cfg.existing_blob_path {
+                    if let Some(storage) = blockfile_provider.storage() {
+                        if let Err(e) =
+                            Self::load_head_bloom_filters_into(&cache, &storage, blob_path).await
+                        {
+                            tracing::warn!(
+                                "Failed to load existing head bloom blob at {}: {}",
+                                blob_path,
+                                e
+                            );
+                        }
+                    }
+                }
+                (
+                    true,
+                    cache,
+                    cfg.doc_tokens_cache_enabled,
+                    cfg.commit_rebuild_enabled,
+                )
+            }
+            None => (false, HeadBloomCache::new(0), false, false),
+        };
+
         Ok(Self::new(
             hnsw_index,
             hnsw_provider.clone(),
@@ -738,7 +800,28 @@ impl SpannIndexWriter {
             metrics,
             prefix_path.to_string(),
             cmek,
+            head_bloom_enabled,
+            head_bloom_cache,
+            head_bloom_doc_tokens_cache_enabled,
+            head_bloom_commit_rebuild_enabled,
         ))
+    }
+
+    async fn load_head_bloom_filters_into(
+        cache: &HeadBloomCache,
+        storage: &Storage,
+        path: &str,
+    ) -> Result<(), String> {
+        let bytes = storage
+            .get(path, GetOptions::new(StorageRequestPriority::P0))
+            .await
+            .map_err(|e| e.to_string())?;
+        let map: HashMap<u32, HeadBloomBlob> =
+            bincode::deserialize(&bytes[..]).map_err(|e| e.to_string())?;
+        for (head_id, blob) in map {
+            cache.insert_loaded(head_id, HeadBloom::from_blob(blob));
+        }
+        Ok(())
     }
 
     async fn add_versions_map(&self, id: u32) -> u32 {
@@ -842,6 +925,9 @@ impl SpannIndexWriter {
                             );
                             SpannIndexWriterError::PostingListSetError(e)
                         })?;
+                    if self.head_bloom_enabled {
+                        self.head_bloom_cache.remove(head_id);
+                    }
                 }
             }
             Ok(None) => {}
@@ -1016,6 +1102,7 @@ impl SpannIndexWriter {
                 next_version,
                 doc_embedding,
                 nearest_head_embedding,
+                None,
             )
             .await?;
         }
@@ -1154,6 +1241,7 @@ impl SpannIndexWriter {
         version: u32,
         embedding: &[f32],
         head_embedding: Vec<f32>,
+        metadata_tokens: Option<&[String]>,
     ) -> Result<(), SpannIndexWriterError> {
         let mut new_posting_lists: Vec<Vec<f32>> = Vec::with_capacity(2);
         let mut new_doc_offset_ids: Vec<Vec<u32>> = Vec::with_capacity(2);
@@ -1167,7 +1255,9 @@ impl SpannIndexWriter {
                 if self.is_outdated(id, version).await? {
                     return Ok(());
                 }
-                // Try again.
+                // Try again. Note: tokens drop on this path; the inner reassign
+                // calls append with metadata_tokens=None and the bloom hook
+                // marks dest heads stale (or uses doc_tokens cache when on).
                 drop(write_guard);
                 return Box::pin(self.reassign(
                     id,
@@ -1258,6 +1348,12 @@ impl SpannIndexWriter {
                 self.stats
                     .num_pl_modified
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.head_bloom_enabled {
+                    match metadata_tokens {
+                        Some(toks) => self.head_bloom_cache.insert_tokens(head_id, toks),
+                        None => self.handle_reassign_bloom(head_id, id),
+                    }
+                }
 
                 return Ok(());
             }
@@ -1391,6 +1487,15 @@ impl SpannIndexWriter {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         new_head_ids[k] = head_id as i32;
                         new_head_embeddings[k] = Some(head_embedding.as_slice());
+                        // Parent reused: insert tokens into parent's filter.
+                        if self.head_bloom_enabled {
+                            match metadata_tokens {
+                                Some(toks) => {
+                                    self.head_bloom_cache.insert_tokens(head_id, toks)
+                                }
+                                None => self.handle_reassign_bloom(head_id, id),
+                            }
+                        }
                     } else {
                         // Create new head.
                         let next_id = self
@@ -1449,6 +1554,16 @@ impl SpannIndexWriter {
                         self.stats
                             .num_heads_created
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // New child: clone parent's filter, then insert tokens.
+                        if self.head_bloom_enabled {
+                            self.head_bloom_cache.clone_into(head_id, next_id);
+                            match metadata_tokens {
+                                Some(toks) => {
+                                    self.head_bloom_cache.insert_tokens(next_id, toks)
+                                }
+                                None => self.handle_reassign_bloom(next_id, id),
+                            }
+                        }
                     }
                 }
                 if !same_head {
@@ -1483,6 +1598,10 @@ impl SpannIndexWriter {
                     self.stats
                         .num_heads_deleted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Parent decommissioned: drop its filter.
+                    if self.head_bloom_enabled {
+                        self.head_bloom_cache.remove(head_id);
+                    }
                 }
             }
         }
@@ -1505,6 +1624,7 @@ impl SpannIndexWriter {
         id: u32,
         version: u32,
         embeddings: &[f32],
+        metadata_tokens: Option<&[String]>,
     ) -> Result<(), SpannIndexWriterError> {
         let (ids, _, head_embeddings) = self.rng_query(embeddings).await?;
         // The only cases when this can happen is initially when no data exists in the
@@ -1566,17 +1686,55 @@ impl SpannIndexWriter {
                     .num_heads_created
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            if self.head_bloom_enabled {
+                match metadata_tokens {
+                    Some(toks) => self.head_bloom_cache.insert_tokens(next_id, toks),
+                    None => self.handle_reassign_bloom(next_id, id),
+                }
+            }
             return Ok(());
         }
         // Otherwise add to the posting list of these arrays.
         for (head_id, head_embedding) in ids.iter().zip(head_embeddings) {
-            Box::pin(self.append(*head_id as u32, id, version, embeddings, head_embedding)).await?;
+            Box::pin(self.append(
+                *head_id as u32,
+                id,
+                version,
+                embeddings,
+                head_embedding,
+                metadata_tokens,
+            ))
+            .await?;
         }
 
         Ok(())
     }
 
+    fn handle_reassign_bloom(&self, head_id: u32, doc_id: u32) {
+        if !self.head_bloom_enabled {
+            return;
+        }
+        let used_cache = if self.head_bloom_doc_tokens_cache_enabled {
+            self.head_bloom_cache
+                .record_doc_appended_to_head(head_id, doc_id)
+        } else {
+            false
+        };
+        if !used_cache {
+            self.head_bloom_cache.mark_stale(head_id);
+        }
+    }
+
     pub async fn add(&self, id: u32, embedding: &[f32]) -> Result<(), SpannIndexWriterError> {
+        self.add_with_metadata_tokens(id, embedding, &[]).await
+    }
+
+    pub async fn add_with_metadata_tokens(
+        &self,
+        id: u32,
+        embedding: &[f32],
+        metadata_tokens: &[String],
+    ) -> Result<(), SpannIndexWriterError> {
         let version = self.add_versions_map(id).await;
         // Normalize the embedding in case of cosine.
         let mut normalized_embedding = embedding.to_vec();
@@ -1584,12 +1742,28 @@ impl SpannIndexWriter {
         if distance_function == DistanceFunction::Cosine {
             normalized_embedding = normalize(embedding);
         }
-        // Add to the posting list.
-        self.add_to_postings_list(id, version, &normalized_embedding)
+        if self.head_bloom_enabled {
+            self.head_bloom_cache.seed_doc_tokens(id, metadata_tokens);
+        }
+        let token_arg = if self.head_bloom_enabled {
+            Some(metadata_tokens)
+        } else {
+            None
+        };
+        self.add_to_postings_list(id, version, &normalized_embedding, token_arg)
             .await
     }
 
     pub async fn update(&self, id: u32, embedding: &[f32]) -> Result<(), SpannIndexWriterError> {
+        self.update_with_metadata_tokens(id, embedding, &[]).await
+    }
+
+    pub async fn update_with_metadata_tokens(
+        &self,
+        id: u32,
+        embedding: &[f32],
+        metadata_tokens: &[String],
+    ) -> Result<(), SpannIndexWriterError> {
         let inc_version;
         {
             // Increment version.
@@ -1614,14 +1788,26 @@ impl SpannIndexWriter {
         if distance_function == DistanceFunction::Cosine {
             normalized_embedding = normalize(embedding);
         }
-        // Add to the posting list.
-        self.add_to_postings_list(id, inc_version, &normalized_embedding)
+        if self.head_bloom_enabled {
+            self.head_bloom_cache.seed_doc_tokens(id, metadata_tokens);
+        }
+        let token_arg = if self.head_bloom_enabled {
+            Some(metadata_tokens)
+        } else {
+            None
+        };
+        self.add_to_postings_list(id, inc_version, &normalized_embedding, token_arg)
             .await
     }
 
     pub async fn delete(&self, id: u32) -> Result<(), SpannIndexWriterError> {
-        let mut version_map_guard = self.versions_map.write().await;
-        version_map_guard.versions_map.insert(id, 0);
+        {
+            let mut version_map_guard = self.versions_map.write().await;
+            version_map_guard.versions_map.insert(id, 0);
+        }
+        if self.head_bloom_enabled {
+            self.head_bloom_cache.forget_doc(id);
+        }
         Ok(())
     }
 
@@ -1899,6 +2085,13 @@ impl SpannIndexWriter {
                     self.stats
                         .num_heads_deleted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Source head_id merged into nearest_head_id; absorb its
+                    // bloom and drop the source's filter.
+                    if self.head_bloom_enabled {
+                        self.head_bloom_cache
+                            .union_into(head_id as u32, nearest_head_id as u32);
+                        self.head_bloom_cache.remove(head_id as u32);
+                    }
                 } else {
                     self.posting_list_writer
                         .set("", head_id as u32, &merged_posting_list)
@@ -1943,6 +2136,13 @@ impl SpannIndexWriter {
                     self.stats
                         .num_heads_deleted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // nearest_head_id merged into head_id; absorb its bloom
+                    // and drop the source's filter.
+                    if self.head_bloom_enabled {
+                        self.head_bloom_cache
+                            .union_into(nearest_head_id as u32, head_id as u32);
+                        self.head_bloom_cache.remove(nearest_head_id as u32);
+                    }
                 }
                 // This center is now merged with a neighbor.
                 target_head = nearest_head_id;
@@ -2321,8 +2521,60 @@ impl SpannIndexWriter {
         );
     }
 
+    /// Phase 1.5 Option 2: rebuild every touched head's bloom filter from the
+    /// posting list × doc-tokens cache. Marks the head stale on cache miss
+    /// (e.g. doc tokens were never seen by this writer).
+    async fn rebuild_blooms_from_cache(&self) -> Result<(), SpannIndexWriterError> {
+        let head_ids = self.head_bloom_cache.touched_head_ids();
+        for head_id in head_ids {
+            if self.is_head_deleted(head_id as usize).await? {
+                continue;
+            }
+            let pl = match self
+                .posting_list_writer
+                .get_owned::<u32, &SpannPostingList<'_>>("", head_id)
+                .await
+            {
+                Ok(Some(pl)) => pl,
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(SpannIndexWriterError::PostingListGetError(e));
+                }
+            };
+            let (doc_offset_ids, doc_versions, _) = pl;
+            let fresh = HeadBloom::new(self.head_bloom_cache.capacity_per_head().max(1));
+            let mut any_miss = false;
+            {
+                let version_map_guard = self.versions_map.read().await;
+                for (doc_id, doc_version) in doc_offset_ids.iter().zip(doc_versions.iter()) {
+                    let current = match version_map_guard.versions_map.get(doc_id) {
+                        Some(v) => *v,
+                        None => continue,
+                    };
+                    if current == 0 || *doc_version < current {
+                        continue;
+                    }
+                    let Some(tokens) = self.head_bloom_cache.get_doc_tokens(*doc_id) else {
+                        any_miss = true;
+                        break;
+                    };
+                    fresh.insert_many(tokens.iter().map(|s| s.as_str()));
+                }
+            }
+            if any_miss {
+                self.head_bloom_cache.mark_stale(head_id);
+            } else {
+                self.head_bloom_cache.replace_filter(head_id, fresh);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn commit(self) -> Result<SpannIndexFlusher, SpannIndexWriterError> {
         self.emit_counters();
+        if self.head_bloom_enabled && self.head_bloom_commit_rebuild_enabled {
+            self.rebuild_blooms_from_cache().await?;
+        }
         // NOTE(Sanket): This is not the best way to drain the writer but the orchestrator keeps a
         // reference to the writer so cannot do an Arc::try_unwrap() here.
         // Pl list.
@@ -2460,6 +2712,35 @@ impl SpannIndexWriter {
             (hnsw_id, prefix_path, hnsw_index)
         };
 
+        let head_bloom_blob = if self.head_bloom_enabled && !self.head_bloom_cache.is_empty() {
+            let mut map: HashMap<u32, HeadBloomBlob> = HashMap::new();
+            for (head_id, filter) in self.head_bloom_cache.iter_non_stale() {
+                map.insert(head_id, filter.to_blob());
+            }
+            match bincode::serialize(&map) {
+                Ok(bytes) => {
+                    let blob_id = Uuid::new_v4();
+                    let path = if self.prefix_path.is_empty() {
+                        blob_id.to_string()
+                    } else {
+                        format!("{}/{}", self.prefix_path, blob_id)
+                    };
+                    Some(HeadBloomBlobFlusher {
+                        bytes,
+                        path,
+                        blob_id,
+                        storage: self.blockfile_provider.storage(),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize head bloom blob: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(SpannIndexFlusher {
             pl_flusher,
             versions_map_flusher,
@@ -2481,6 +2762,7 @@ impl SpannIndexWriter {
                     .num_versions_map_entries_flushed
                     .clone(),
             },
+            head_bloom_blob,
         })
     }
 }
@@ -2499,6 +2781,7 @@ pub struct SpannIndexFlusher {
     pub(crate) max_head_id_flusher: BlockfileFlusher,
     pub(crate) hnsw_flusher: HnswIndexFlusher,
     pub(crate) metrics: SpannIndexFlusherMetrics,
+    pub(crate) head_bloom_blob: Option<HeadBloomBlobFlusher>,
 }
 
 #[derive(Debug)]
@@ -2508,16 +2791,19 @@ pub struct SpannIndexIds {
     pub max_head_id_id: Uuid,
     pub hnsw_id: IndexUuid,
     pub prefix_path: String,
+    pub head_bloom_blob_path: Option<String>,
 }
 
 impl SpannIndexFlusher {
     pub async fn flush(self) -> Result<SpannIndexIds, SpannIndexWriterError> {
-        let res = SpannIndexIds {
+        let head_bloom_blob_path = self.head_bloom_blob.as_ref().map(|b| b.path.clone());
+        let mut res = SpannIndexIds {
             pl_id: self.pl_flusher.id(),
             versions_map_id: self.versions_map_flusher.id(),
             max_head_id_id: self.max_head_id_flusher.id(),
             hnsw_id: self.hnsw_flusher.index_id,
             prefix_path: self.max_head_id_flusher.prefix_path().to_string(),
+            head_bloom_blob_path: None,
         };
 
         {
@@ -2597,6 +2883,13 @@ impl SpannIndexFlusher {
                 res.hnsw_id,
                 stopwatch.elapsed_micros() / 1000
             );
+        }
+        if let Some(blob) = self.head_bloom_blob {
+            blob.save().await.map_err(|e| {
+                tracing::error!("Error saving head bloom blob: {}", e);
+                SpannIndexWriterError::HeadBloomBlobSaveError(e.to_string())
+            })?;
+            res.head_bloom_blob_path = head_bloom_blob_path;
         }
         Ok(res)
     }
@@ -2685,6 +2978,7 @@ pub struct SpannIndexReader<'me> {
     pub dimensionality: usize,
     pub adaptive_search_nprobe: bool,
     pub params: InternalSpannConfiguration,
+    pub head_bloom_filters: Option<Arc<HeadBloomCache>>,
 }
 
 impl<'me> SpannIndexReader<'me> {
@@ -2767,6 +3061,7 @@ impl<'me> SpannIndexReader<'me> {
         prefix_path: &str,
         adaptive_search_nprobe: bool,
         params: InternalSpannConfiguration,
+        head_bloom_config: Option<HeadBloomReadConfig<'_>>,
     ) -> Result<SpannIndexReader<'me>, SpannIndexReaderError> {
         let hnsw_reader = match hnsw_id {
             Some(hnsw_id) => {
@@ -2806,6 +3101,26 @@ impl<'me> SpannIndexReader<'me> {
                 }
             };
 
+        let head_bloom_filters = if let Some(cfg) = head_bloom_config {
+            if let (Some(blob_path), Some(storage)) = (cfg.blob_path, blockfile_provider.storage()) {
+                match Self::load_head_bloom_filters(&storage, blob_path).await {
+                    Ok(cache) => Some(Arc::new(cache)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load head bloom blob at {}: {}; degrading gate to no-op",
+                            blob_path,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             posting_lists: postings_list_reader,
             hnsw_index: hnsw_reader,
@@ -2813,7 +3128,47 @@ impl<'me> SpannIndexReader<'me> {
             dimensionality,
             adaptive_search_nprobe,
             params,
+            head_bloom_filters,
         })
+    }
+
+    async fn load_head_bloom_filters(
+        storage: &Storage,
+        path: &str,
+    ) -> Result<HeadBloomCache, String> {
+        let bytes = storage
+            .get(path, GetOptions::new(StorageRequestPriority::P0))
+            .await
+            .map_err(|e| e.to_string())?;
+        let map: HashMap<u32, HeadBloomBlob> =
+            bincode::deserialize(&bytes[..]).map_err(|e| e.to_string())?;
+        let cache = HeadBloomCache::new(0);
+        for (head_id, blob) in map {
+            cache.insert_loaded(head_id, HeadBloom::from_blob(blob));
+        }
+        Ok(cache)
+    }
+
+    /// Free function gate: keeps heads whose filters say "possibly contains".
+    /// Pass-through if there are no loaded filters or the predicate is not
+    /// gateable. Returns kept head ids in the same order as the input.
+    pub fn gate_heads(
+        &self,
+        candidate_head_ids: &[usize],
+        tokens: &EqualityTokens,
+    ) -> Vec<usize> {
+        let Some(cache) = &self.head_bloom_filters else {
+            return candidate_head_ids.to_vec();
+        };
+        if !tokens.is_gateable() {
+            return candidate_head_ids.to_vec();
+        }
+        let kept = head_bloom::gate_heads(
+            candidate_head_ids.iter().map(|h| *h as u32),
+            tokens,
+            |hid| cache.get(hid),
+        );
+        kept.into_iter().map(|h| h as usize).collect()
     }
 
     fn is_version_outdated(actual_version: u32, doc_version: u32) -> bool {
@@ -3146,6 +3501,7 @@ mod tests {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            None,
         )
         .await
         .expect("Error creating spann index writer");
@@ -3362,6 +3718,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
         )
         .await
@@ -3624,6 +3981,7 @@ mod tests {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            None,
         )
         .await
         .expect("Error creating spann index writer");
@@ -3849,6 +4207,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
         )
         .await
@@ -4117,6 +4476,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
         )
         .await
@@ -4428,6 +4788,7 @@ mod tests {
                 pl_block_size,
                 SpannMetrics::default(),
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -4469,6 +4830,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -4545,6 +4907,7 @@ mod tests {
                 pl_block_size,
                 SpannMetrics::default(),
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -4608,6 +4971,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -4686,6 +5050,7 @@ mod tests {
                     pl_block_size,
                     SpannMetrics::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("Error creating spann index writer");
@@ -4735,6 +5100,7 @@ mod tests {
                 prefix_path,
                 true,
                 params.clone(),
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -4830,6 +5196,7 @@ mod tests {
                     pl_block_size,
                     SpannMetrics::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("Error creating spann index writer");
@@ -4889,6 +5256,7 @@ mod tests {
                 prefix_path,
                 true,
                 params.clone(),
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -4994,6 +5362,7 @@ mod tests {
                     gc_context.clone(),
                     pl_block_size,
                     SpannMetrics::default(),
+                    None,
                     None,
                 )
                 .await
@@ -5112,6 +5481,7 @@ mod tests {
                 pl_block_size,
                 SpannMetrics::default(),
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -5188,6 +5558,7 @@ mod tests {
                 prefix_path,
                 true,
                 params.clone(),
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -5236,6 +5607,7 @@ mod tests {
                 pl_block_size,
                 SpannMetrics::default(),
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -5265,6 +5637,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
             ))
             .await
             .expect("Error creating spann index reader");

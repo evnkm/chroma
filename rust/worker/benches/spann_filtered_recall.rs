@@ -220,6 +220,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         pl_block_size,
         SpannMetrics::default(),
         None,
+        None,
     )
     .await
     .expect("spann writer");
@@ -254,6 +255,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             prefix_path,
             false, // disable size-based adaptive_search_nprobe so base_nprobe is honored
             params_for_reader,
+            None,
         ))
         .await
         .expect("spann reader");

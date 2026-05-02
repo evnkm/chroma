@@ -2209,6 +2209,7 @@ impl FastSpannIndexWriter {
                     .num_versions_map_entries_flushed
                     .clone(),
             },
+            head_bloom_blob: None,
         })
     }
 }

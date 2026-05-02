@@ -1267,6 +1267,10 @@ mod tests {
             hnsw_provider: hnsw_provider.clone(),
             metrics: SpannMetrics::default(),
             pl_block_size: 5 * 1024 * 1024,
+            head_bloom_enabled: false,
+            head_bloom_capacity_factor: 4,
+            head_bloom_doc_tokens_cache: false,
+            head_bloom_commit_rebuild: false,
             usearch_provider,
         };
         let system = System::new();

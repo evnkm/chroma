@@ -28,6 +28,7 @@ pub const HNSW_PATH: &str = "hnsw_path";
 pub const VERSION_MAP_PATH: &str = "version_map_path";
 pub const POSTING_LIST_PATH: &str = "posting_list_path";
 pub const MAX_HEAD_ID_BF_PATH: &str = "max_head_id_path";
+pub const HEAD_BLOOM_FILTERS_PATH: &str = "head_bloom_filters_path";
 
 pub const QUANTIZED_SPANN_CLUSTER: &str = "quantized_spann_cluster";
 pub const QUANTIZED_SPANN_SCALAR_METADATA: &str = "quantized_spann_scalar_metadata";

@@ -3,6 +3,7 @@ use chroma_blockstore::provider::BlockfileProvider;
 use chroma_distance::DistanceFunction;
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::hnsw_provider::HnswIndexProvider;
+use chroma_index::spann::head_bloom::{extract_equality_tokens, EqualityTokens};
 use chroma_segment::{
     bloom_filter::BloomFilterManager,
     distributed_hnsw::{DistributedHNSWSegmentFromSegmentError, DistributedHNSWSegmentReader},
@@ -151,6 +152,11 @@ pub struct KnnFilterOutput {
     pub dimension: usize,
     pub distance_function: DistanceFunction,
     pub hnsw_reader: Option<Box<DistributedHNSWSegmentReader>>,
+    /// Tokens extracted from `Filter::where_clause` for the head-bloom gate.
+    /// `Unsupported` for predicates we can't reduce to membership tests; the
+    /// gate then becomes a pass-through. Present even on configs without
+    /// bloom filters loaded — the reader's gate handles the no-op case.
+    pub head_bloom_tokens: EqualityTokens,
 }
 
 type KnnFilterResult = Result<KnnFilterOutput, KnnError>;
@@ -550,6 +556,11 @@ impl Handler<TaskResult<FilterOutput, FilterError>> for KnnFilterOrchestrator {
 
         let fetch_log_bytes = logs.iter().map(|(l, _)| l.size_bytes()).sum();
 
+        let head_bloom_tokens = match self.filter.where_clause.as_ref() {
+            Some(w) => extract_equality_tokens(w),
+            None => EqualityTokens::Unsupported,
+        };
+
         let output = KnnFilterOutput {
             logs,
             fetch_log_bytes,
@@ -557,6 +568,7 @@ impl Handler<TaskResult<FilterOutput, FilterError>> for KnnFilterOrchestrator {
             dimension: collection_dimension as usize,
             distance_function,
             hnsw_reader,
+            head_bloom_tokens,
         };
         self.terminate_with_result(Ok(output), ctx).await;
     }

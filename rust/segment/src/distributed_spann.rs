@@ -7,6 +7,7 @@ use super::types::{
 };
 use chroma_blockstore::provider::BlockfileProvider;
 use chroma_error::{ChromaError, ErrorCodes};
+use chroma_index::spann::head_bloom::{doc_tokens, HeadBloomReadConfig, HeadBloomWriteConfig};
 use chroma_index::spann::types::GarbageCollectionContext;
 use chroma_index::spann::types::SpannMetrics;
 use chroma_index::spann::types::{
@@ -19,6 +20,7 @@ use chroma_types::Collection;
 use chroma_types::Schema;
 use chroma_types::SchemaError;
 use chroma_types::SegmentUuid;
+use chroma_types::HEAD_BLOOM_FILTERS_PATH;
 use chroma_types::HNSW_PATH;
 use chroma_types::MAX_HEAD_ID_BF_PATH;
 use chroma_types::POSTING_LIST_PATH;
@@ -109,6 +111,10 @@ impl SpannSegmentWriterShard {
         pl_block_size: usize,
         metrics: SpannMetrics,
         cmek: Option<Cmek>,
+        head_bloom_enabled: bool,
+        head_bloom_capacity_factor: u32,
+        head_bloom_doc_tokens_cache: bool,
+        head_bloom_commit_rebuild: bool,
     ) -> Result<SpannSegmentWriterShard, SpannSegmentWriterShardError> {
         if segment.r#type != SegmentType::Spann || segment.scope != SegmentScope::VECTOR {
             return Err(SpannSegmentWriterShardError::InvalidArgument);
@@ -175,6 +181,25 @@ impl SpannSegmentWriterShard {
             Some(prefix) => prefix,
             None => segment.construct_prefix_path(&collection.tenant, &collection.database_id),
         };
+
+        let head_bloom_blob_path: Option<String> = segment
+            .file_path
+            .get(HEAD_BLOOM_FILTERS_PATH)
+            .cloned();
+        let head_bloom_config = if head_bloom_enabled {
+            let capacity = (params.split_threshold as u64)
+                .saturating_mul(head_bloom_capacity_factor.max(1) as u64)
+                .max(1);
+            Some(HeadBloomWriteConfig {
+                capacity_per_head: capacity,
+                existing_blob_path: head_bloom_blob_path.as_deref(),
+                doc_tokens_cache_enabled: head_bloom_doc_tokens_cache,
+                commit_rebuild_enabled: head_bloom_commit_rebuild,
+            })
+        } else {
+            None
+        };
+
         let index_writer = match SpannIndexWriter::from_id(
             hnsw_provider,
             hnsw_id.as_ref(),
@@ -190,6 +215,7 @@ impl SpannSegmentWriterShard {
             pl_block_size,
             metrics,
             cmek,
+            head_bloom_config,
         )
         .await
         {
@@ -211,8 +237,17 @@ impl SpannSegmentWriterShard {
         &self,
         record: &HydratedMaterializedLogRecord<'_, '_>,
     ) -> Result<(), SpannSegmentWriterShardError> {
+        let tokens = if self.index.head_bloom_enabled {
+            doc_tokens(&record.merged_metadata())
+        } else {
+            Vec::new()
+        };
         self.index
-            .add(record.get_offset_id(), record.merged_embeddings_ref())
+            .add_with_metadata_tokens(
+                record.get_offset_id(),
+                record.merged_embeddings_ref(),
+                &tokens,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Error adding record to spann index writer {:?}", e);
@@ -237,8 +272,17 @@ impl SpannSegmentWriterShard {
         &self,
         record: &HydratedMaterializedLogRecord<'_, '_>,
     ) -> Result<(), SpannSegmentWriterShardError> {
+        let tokens = if self.index.head_bloom_enabled {
+            doc_tokens(&record.merged_metadata())
+        } else {
+            Vec::new()
+        };
         self.index
-            .update(record.get_offset_id(), record.merged_embeddings_ref())
+            .update_with_metadata_tokens(
+                record.get_offset_id(),
+                record.merged_embeddings_ref(),
+                &tokens,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Error updating record in spann index writer {:?}", e);
@@ -383,6 +427,12 @@ impl SpannSegmentFlusherShard {
                         &index_ids.max_head_id_id,
                     )],
                 );
+                if let Some(blob_path) = index_ids.head_bloom_blob_path.as_ref() {
+                    index_id_map.insert(
+                        HEAD_BLOOM_FILTERS_PATH.to_string(),
+                        vec![blob_path.clone()],
+                    );
+                }
                 tracing::info!(
                     segment_id = %self.id,
                     collection_version = self.collection_version,
@@ -508,6 +558,16 @@ impl<'me> SpannSegmentReaderShard<'me> {
             None => segment.construct_prefix_path(&collection.tenant, &collection.database_id),
         };
 
+        let head_bloom_blob_path: Option<String> = segment
+            .file_path
+            .get(HEAD_BLOOM_FILTERS_PATH)
+            .cloned();
+        let head_bloom_config = head_bloom_blob_path
+            .as_ref()
+            .map(|p| HeadBloomReadConfig {
+                blob_path: Some(p.as_str()),
+            });
+
         let index_reader = match Box::pin(SpannIndexReader::from_id(
             hnsw_id.as_ref(),
             hnsw_provider,
@@ -521,6 +581,7 @@ impl<'me> SpannSegmentReaderShard<'me> {
             &prefix_path,
             adaptive_search_nprobe,
             params,
+            head_bloom_config,
         ))
         .await
         {
@@ -576,6 +637,16 @@ impl<'me> SpannSegmentReaderShard<'me> {
                 tracing::error!("Error performing rng query: {:?}", e);
                 SpannSegmentReaderShardError::RngError(e)
             })
+    }
+
+    /// Drop heads whose bloom filter says the metadata predicate cannot match.
+    /// No-op when no filters are loaded or the predicate isn't gateable.
+    pub fn gate_heads(
+        &self,
+        candidate_head_ids: &[usize],
+        tokens: &chroma_index::spann::head_bloom::EqualityTokens,
+    ) -> Vec<usize> {
+        self.index_reader.gate_heads(candidate_head_ids, tokens)
     }
 }
 
@@ -686,6 +757,10 @@ mod test {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            false,
+            4,
+            false,
+            false,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -787,6 +862,10 @@ mod test {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            false,
+            4,
+            false,
+            false,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -925,6 +1004,10 @@ mod test {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            false,
+            4,
+            false,
+            false,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -1113,6 +1196,10 @@ mod test {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            false,
+            4,
+            false,
+            false,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -1221,6 +1308,10 @@ mod test {
             pl_block_size,
             SpannMetrics::default(),
             None,
+            false,
+            4,
+            false,
+            false,
         )
         .await
         .expect("Error creating spann segment writer");

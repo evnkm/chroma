@@ -245,6 +245,10 @@ impl Orchestrator for SpannKnnOrchestrator {
                         collection_num_records_post_compaction: total_records,
                         k: self.k,
                         filter_selectivity,
+                        head_bloom_tokens: self
+                            .knn_filter_output
+                            .head_bloom_tokens
+                            .clone(),
                     },
                     ctx.receiver(),
                     self.context.task_cancellation_token.clone(),
@@ -319,6 +323,11 @@ impl Handler<TaskResult<SpannCentersSearchOutput, SpannCentersSearchError>>
             Some(output) => output,
             None => return,
         };
+        tracing::debug!(
+            heads_rng = output.heads_rng,
+            heads_after_bloom = output.heads_after_bloom,
+            "spann centers search completed"
+        );
         // Set state that is used for tracking when we are ready for merging.
         self.heads_searched = true;
         self.num_outstanding_bf_pl = output.center_ids.len();

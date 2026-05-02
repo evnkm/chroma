@@ -59,6 +59,22 @@ fn default_adaptive_search_nprobe() -> bool {
     true
 }
 
+fn default_head_bloom_enabled() -> bool {
+    false
+}
+
+fn default_head_bloom_capacity_factor() -> u32 {
+    4
+}
+
+fn default_head_bloom_doc_tokens_cache() -> bool {
+    false
+}
+
+fn default_head_bloom_commit_rebuild() -> bool {
+    false
+}
+
 #[derive(Deserialize, Debug, Clone, Serialize)]
 pub enum PlGarbageCollectionPolicyConfig {
     #[serde(rename = "random_sample")]
@@ -81,6 +97,14 @@ pub struct SpannProviderConfig {
     pub pl_block_size: usize,
     #[serde(default = "default_pl_garbage_collection")]
     pub pl_garbage_collection: PlGarbageCollectionConfig,
+    #[serde(default = "default_head_bloom_enabled")]
+    pub head_bloom_enabled: bool,
+    #[serde(default = "default_head_bloom_capacity_factor")]
+    pub head_bloom_capacity_factor: u32,
+    #[serde(default = "default_head_bloom_doc_tokens_cache")]
+    pub head_bloom_doc_tokens_cache: bool,
+    #[serde(default = "default_head_bloom_commit_rebuild")]
+    pub head_bloom_commit_rebuild: bool,
     #[cfg(feature = "usearch")]
     #[serde(default)]
     pub usearch_provider: USearchProviderConfig,

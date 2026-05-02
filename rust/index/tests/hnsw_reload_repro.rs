@@ -157,6 +157,7 @@ fn run_repro(seed: u64) {
                 5 * 1024 * 1024,
                 SpannMetrics::default(),
                 None,
+                None,
             )
             .await
             .expect("writer should open");
@@ -207,6 +208,7 @@ fn run_repro(seed: u64) {
             prefix_path,
             true,
             params,
+            None,
         ))
         .await
         .expect("final reader open should reach the HNSW load");

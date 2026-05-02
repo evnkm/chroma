@@ -25,6 +25,10 @@ pub struct SpannProvider {
     pub hnsw_provider: HnswIndexProvider,
     pub metrics: SpannMetrics,
     pub pl_block_size: usize,
+    pub head_bloom_enabled: bool,
+    pub head_bloom_capacity_factor: u32,
+    pub head_bloom_doc_tokens_cache: bool,
+    pub head_bloom_commit_rebuild: bool,
     #[cfg(feature = "usearch")]
     pub usearch_provider: USearchIndexProvider,
 }
@@ -57,6 +61,10 @@ impl Configurable<(HnswIndexProvider, BlockfileProvider, SpannProviderConfig)> f
             hnsw_provider: config.0.clone(),
             metrics: SpannMetrics::default(),
             pl_block_size: config.2.pl_block_size,
+            head_bloom_enabled: config.2.head_bloom_enabled,
+            head_bloom_capacity_factor: config.2.head_bloom_capacity_factor,
+            head_bloom_doc_tokens_cache: config.2.head_bloom_doc_tokens_cache,
+            head_bloom_commit_rebuild: config.2.head_bloom_commit_rebuild,
         })
     }
 }
@@ -95,6 +103,10 @@ impl
             hnsw_provider: config.0.clone(),
             metrics: SpannMetrics::default(),
             pl_block_size: config.2.pl_block_size,
+            head_bloom_enabled: config.2.head_bloom_enabled,
+            head_bloom_capacity_factor: config.2.head_bloom_capacity_factor,
+            head_bloom_doc_tokens_cache: config.2.head_bloom_doc_tokens_cache,
+            head_bloom_commit_rebuild: config.2.head_bloom_commit_rebuild,
             usearch_provider: config.3.clone(),
         })
     }
@@ -118,6 +130,10 @@ impl SpannProvider {
             self.pl_block_size,
             self.metrics.clone(),
             cmek,
+            self.head_bloom_enabled,
+            self.head_bloom_capacity_factor,
+            self.head_bloom_doc_tokens_cache,
+            self.head_bloom_commit_rebuild,
         )
         .await
     }

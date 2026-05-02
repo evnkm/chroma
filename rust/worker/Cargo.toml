@@ -111,3 +111,7 @@ harness = false
 [[bench]]
 name = "spann_filtered_recall"
 harness = false
+
+[[bench]]
+name = "spann_bloom_ablation"
+harness = false
