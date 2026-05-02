@@ -12,7 +12,7 @@ use chroma_system::{
 };
 use chroma_types::{
     operator::{Knn, KnnOutput, Merge, RecordMeasure},
-    CollectionAndSegments, SegmentShard,
+    CollectionAndSegments, SegmentShard, SignedRoaringBitmap,
 };
 use tokio::sync::oneshot::Sender;
 use tracing::Span;
@@ -203,18 +203,48 @@ impl Orchestrator for SpannKnnOrchestrator {
         match reader_res {
             Ok(reader) => {
                 self.spann_reader = Some(reader.clone());
+                // Estimate filter selectivity over the compacted index so that
+                // SPANN center search probes more centers when the filter is
+                // restrictive. None when the filter is absent or the
+                // collection size is unknown — in that case the index reader
+                // falls back to size-based / configured nprobe.
+                let total_records = self
+                    .collection_and_segments
+                    .collection
+                    .total_records_post_compaction
+                    as usize;
+                let filter_selectivity: Option<f64> = match &self
+                    .knn_filter_output
+                    .filter_output
+                    .compact_offset_ids
+                {
+                    SignedRoaringBitmap::Exclude(rbm) if rbm.is_empty() => None,
+                    SignedRoaringBitmap::Include(rbm) => {
+                        if total_records > 0 {
+                            Some((rbm.len() as f64 / total_records as f64).clamp(0.0, 1.0))
+                        } else {
+                            None
+                        }
+                    }
+                    SignedRoaringBitmap::Exclude(rbm) => {
+                        if total_records > 0 {
+                            Some(
+                                (1.0 - rbm.len() as f64 / total_records as f64).clamp(0.0, 1.0),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                };
                 // Spawn the centers search task if reader is found.
                 let head_search_task = wrap(
                     Box::new(self.head_search.clone()),
                     SpannCentersSearchInput {
                         reader: Some(reader),
                         normalized_query: self.normalized_query_emb.clone(),
-                        collection_num_records_post_compaction: self
-                            .collection_and_segments
-                            .collection
-                            .total_records_post_compaction
-                            as usize,
+                        collection_num_records_post_compaction: total_records,
                         k: self.k,
+                        filter_selectivity,
                     },
                     ctx.receiver(),
                     self.context.task_cancellation_token.clone(),

@@ -11,6 +11,9 @@ pub(crate) struct SpannCentersSearchInput<'referred_data> {
     pub(crate) normalized_query: Vec<f32>,
     pub(crate) collection_num_records_post_compaction: usize,
     pub(crate) k: usize,
+    // Fraction of compacted records that pass the metadata filter, in [0, 1].
+    // None means no filter / unknown — adaptive boost is skipped.
+    pub(crate) filter_selectivity: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -56,6 +59,7 @@ impl Operator<SpannCentersSearchInput<'_>, SpannCentersSearchOutput>
                         &input.normalized_query,
                         input.collection_num_records_post_compaction,
                         input.k,
+                        input.filter_selectivity,
                     )
                     .await
                     .map_err(|_| SpannCentersSearchError::RngQueryError)?;

@@ -2652,6 +2652,31 @@ pub struct SpannPosting {
     pub doc_embedding: Vec<f32>,
 }
 
+/// Selectivity below which `filter_aware_nprobe` is treated as if the filter
+/// matches at most this fraction of records. Prevents division blow-up.
+pub const ADAPTIVE_NPROBE_EPSILON: f64 = 0.001;
+
+/// Maximum multiplicative boost over `base_nprobe` allowed when the filter is
+/// very selective. With epsilon=0.001 and max_factor=8, the cap is reached at
+/// sel ≈ 0.125 and below.
+pub const ADAPTIVE_NPROBE_MAX_FACTOR: f64 = 8.0;
+
+/// Filter-selectivity-aware boost on top of a size-based nprobe.
+/// Returns `base_nprobe` unchanged when there is no filter (None) or when
+/// the filter passes everything (sel = 1.0).
+pub fn filter_aware_nprobe(base_nprobe: u32, filter_selectivity: Option<f64>) -> u32 {
+    if let Some(sel) = filter_selectivity {
+        let raw = base_nprobe as f64 / sel.max(ADAPTIVE_NPROBE_EPSILON);
+        raw.clamp(
+            base_nprobe as f64,
+            base_nprobe as f64 * ADAPTIVE_NPROBE_MAX_FACTOR,
+        )
+        .round() as u32
+    } else {
+        base_nprobe
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SpannIndexReader<'me> {
     pub posting_lists: BlockfileReader<'me, u32, SpannPostingList<'me>>,
@@ -2820,10 +2845,12 @@ impl<'me> SpannIndexReader<'me> {
         &self,
         collection_num_records_post_compaction: usize,
         k: usize,
+        filter_selectivity: Option<f64>,
     ) -> u32 {
         // Query at least 20x more points than k.
         let min_nprobe = ((k * 20) as f64 / self.params.split_threshold as f64).ceil() as u32;
-        let optimal_nprobe = if self.adaptive_search_nprobe {
+        // Size-based adaptation (existing behavior).
+        let size_based = if self.adaptive_search_nprobe {
             if collection_num_records_post_compaction <= 500000 {
                 24
             } else if collection_num_records_post_compaction <= 1000000 {
@@ -2834,8 +2861,13 @@ impl<'me> SpannIndexReader<'me> {
         } else {
             self.params.search_nprobe
         };
+        // Filter-aware boost: probe more centers when the metadata filter is
+        // restrictive so enough candidates survive the bitmask. Composes with
+        // the size-based adaptation above. No-op when filter_selectivity is
+        // None (no filter) or 1.0 (filter passes everything).
+        let filter_aware = filter_aware_nprobe(size_based, filter_selectivity);
 
-        optimal_nprobe.max(min_nprobe)
+        filter_aware.max(min_nprobe)
     }
 
     pub async fn rng_query(
@@ -2843,11 +2875,16 @@ impl<'me> SpannIndexReader<'me> {
         normalized_query: &[f32],
         collection_num_records_post_compaction: usize,
         k: usize,
+        filter_selectivity: Option<f64>,
     ) -> Result<(Vec<usize>, Vec<f32>, Vec<Vec<f32>>), SpannIndexReaderError> {
         let r = rng_query(
             normalized_query,
             self.hnsw_index.clone(),
-            self.determine_search_nprobe(collection_num_records_post_compaction, k) as usize,
+            self.determine_search_nprobe(
+                collection_num_records_post_compaction,
+                k,
+                filter_selectivity,
+            ) as usize,
             None,
             self.params.search_rng_epsilon,
             self.params.search_rng_factor,
@@ -3015,10 +3052,46 @@ mod tests {
         },
         hnsw_provider::HnswIndexProvider,
         spann::types::{
-            GarbageCollectionContext, SpannIndexReader, SpannIndexWriter, SpannIndexWriterError,
-            SpannMetrics,
+            filter_aware_nprobe, GarbageCollectionContext, SpannIndexReader, SpannIndexWriter,
+            SpannIndexWriterError, SpannMetrics, ADAPTIVE_NPROBE_MAX_FACTOR,
         },
     };
+
+    #[test]
+    fn test_filter_aware_nprobe_no_filter_is_identity() {
+        assert_eq!(filter_aware_nprobe(8, None), 8);
+        assert_eq!(filter_aware_nprobe(64, None), 64);
+    }
+
+    #[test]
+    fn test_filter_aware_nprobe_full_selectivity_is_identity() {
+        // sel = 1.0 → ratio 1 → clamp at base_nprobe.
+        assert_eq!(filter_aware_nprobe(8, Some(1.0)), 8);
+        assert_eq!(filter_aware_nprobe(64, Some(1.0)), 64);
+    }
+
+    #[test]
+    fn test_filter_aware_nprobe_scales_inversely_with_selectivity() {
+        // sel = 0.5 → ratio 2 → 2 * base.
+        assert_eq!(filter_aware_nprobe(8, Some(0.5)), 16);
+        // sel = 0.25 → ratio 4 → 4 * base.
+        assert_eq!(filter_aware_nprobe(8, Some(0.25)), 32);
+    }
+
+    #[test]
+    fn test_filter_aware_nprobe_caps_at_max_factor() {
+        // Very selective: should cap at base * max_factor.
+        let cap = (8.0 * ADAPTIVE_NPROBE_MAX_FACTOR) as u32;
+        assert_eq!(filter_aware_nprobe(8, Some(0.001)), cap);
+        assert_eq!(filter_aware_nprobe(8, Some(0.0001)), cap);
+        assert_eq!(filter_aware_nprobe(8, Some(0.0)), cap);
+    }
+
+    #[test]
+    fn test_filter_aware_nprobe_never_below_base() {
+        // Any selectivity > 1 (defensive — shouldn't happen in practice) clamps up.
+        assert_eq!(filter_aware_nprobe(16, Some(2.0)), 16);
+    }
 
     #[tokio::test]
     async fn test_split() {
