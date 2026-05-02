@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "spann"
 harness = false
+
+[[bench]]
+name = "spann_filtered_recall"
+harness = false

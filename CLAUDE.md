@@ -159,3 +159,56 @@ Sweep axes: selectivity, collection size, embedding dim, `nprobe_base`.
   with alnum. Short dummy names like `'t'` fail validation.
 - BEIR/msmarco streaming can stall past a few thousand rows while fetching
   new shards. For large sweeps, pre-materialize the subset once and cache.
+- An `adaptive_search_nprobe: bool` flag already exists in
+  `SpannIndexReader::determine_search_nprobe`, but it only buckets `nprobe` by
+  collection size (24/32/64). It does **not** consider filter selectivity —
+  that is the change this project adds.
+
+---
+
+## Deliverable workflow (REQUIRED for every result-bearing milestone)
+
+For every concrete deliverable that produces results — a CSV, plot, table,
+benchmark number, image, or implemented feature with measurable behavior —
+do **all** of the following, in order:
+
+1. **Commit the code** for that deliverable with a clear message. Generated
+   artifacts (CSV, plots) go under `LOGS_PLANS/benchmarks/` or
+   `LOGS_ACTIONS/<date>-<slug>/`. Do NOT add the `Co-Authored-By: Claude`
+   trailer (per user preference).
+2. **Capture the commit hash** (`git rev-parse HEAD`).
+3. **Create a Notion entry** under the "6.5830 Final Project" page. Entries
+   live in the "Entries" data source:
+   - data_source_id: `342e10fb-eda6-8065-8670-000b6f5701ce`
+   - title format: `YYYY-MM-DD — <one-line summary>`
+   - body must include: brief summary, what was measured/built, key numbers
+     or a table, plot/image references if any, **the commit hash and short
+     subject line**, and a "Next steps" section.
+4. **Reference the Notion entry URL in the next action log** under
+   `LOGS_ACTIONS/` so the in-repo trail and the Notion trail stay linked.
+
+Use `mcp__claude_ai_Notion__notion-create-pages` with
+`parent: { type: "data_source_id", data_source_id: "342e10fb-eda6-8065-8670-000b6f5701ce" }`.
+The existing entry at `https://www.notion.so/342e10fbeda681fa97c6fd80789e9ddc`
+is the format template (summary, environment notes, table, interpretation,
+next steps).
+
+## Other working preferences
+
+- **Commits:** Never include `Co-Authored-By: Claude ...` in commit messages.
+- **CSV schema (shared across all SPANN benchmarks):**
+
+```text
+dataset, n_records, dim, query_id, k, selectivity, strategy,
+base_nprobe, nprobe_used, returned_count, recall_at_k,
+latency_ms, centers, candidates_before_filter, candidates_after_filter
+```
+
+- **Primary dataset:** SIFT1M subsets (10K → 50K → 100K) via the existing
+  `Sift1MData` loader at `rust/benchmark/src/datasets/sift.rs`. Don't use
+  `GistDataset` — its loader points at a developer-local path.
+- **Build economy:** Always set `CARGO_TARGET_DIR=/tmp/chroma-target` and the
+  three macOS SDK exports before `cargo` invocations. Prefer `cargo check
+  -p <pkg>` over full builds; never run `cargo build --workspace`.
+- **Output locations:** raw CSV → `LOGS_PLANS/benchmarks/`. Plots → same
+  directory, `.png`. Action logs → `LOGS_ACTIONS/YYYY-MM-DD-<slug>.md`.
