@@ -403,6 +403,28 @@ impl SpannSegmentWriterShard {
         }
     }
 
+    /// HEAD_SYNOPSIS.md §7 — commit the SPANN segment with the synopsis
+    /// built from the metadata segment's inverted index instead of the
+    /// SPANN writer's per-doc-token cache.
+    ///
+    /// The metadata-shard reference is used only to snapshot the typed
+    /// inverted indexes; it is not mutated. Call this *before*
+    /// `metadata_shard.finish()` since the in-memory bitmaps are
+    /// consumed by `finish`.
+    ///
+    /// Falls through to the cache-based build if the synopsis is
+    /// disabled, so callers can use this method unconditionally.
+    pub async fn commit_with_metadata_snapshot(
+        self,
+        metadata_shard: &crate::blockfile_metadata::MetadataSegmentWriterShard<'_>,
+    ) -> Result<SpannSegmentFlusherShard, Box<dyn ChromaError>> {
+        if self.index.head_synopsis_enabled {
+            let snapshot = metadata_shard.snapshot_inverted_index_for_synopsis().await;
+            self.index.set_synopsis_inverted_index(snapshot).await;
+        }
+        self.commit().await
+    }
+
     pub fn hnsw_index_uuid(&self) -> IndexUuid {
         self.index.hnsw_index.inner.read().hnsw_index.id
     }

@@ -40,9 +40,10 @@ use crate::{
         HeadBloomReadConfig, HeadBloomWriteConfig,
     },
     spann::head_synopsis::{
-        self, build_head_synopses, HeadRawCounts, HeadSynopsis, HeadSynopsisBlob,
-        HeadSynopsisBlobFlusher, HeadSynopsisCache, HeadSynopsisReadConfig,
-        HeadSynopsisWriteConfig, SynopsisPredicate, SynopsisToken,
+        self, build_head_synopses, build_synopsis_from_inverted_index, HeadRawCounts,
+        HeadSynopsis, HeadSynopsisBlob, HeadSynopsisBlobFlusher, HeadSynopsisCache,
+        HeadSynopsisReadConfig, HeadSynopsisWriteConfig, InvertedIndexSnapshot, SynopsisPredicate,
+        SynopsisToken,
     },
     spann::utils::cluster,
     IndexUuid,
@@ -346,10 +347,18 @@ pub struct SpannIndexWriter {
     pub head_synopsis_top_k_per_key: u32,
     pub head_synopsis_max_cardinality: u32,
     /// Per-doc structured tokens, populated on add/update, cleared on
-    /// delete. Only allocated when synopsis is enabled. The synopsis is
-    /// rebuilt at commit by joining this cache against the committed
-    /// posting lists.
+    /// delete. Only allocated when synopsis is enabled. Used as the
+    /// **fallback** synopsis-build source if no metadata-segment
+    /// snapshot has been provided before commit.
     pub head_synopsis_doc_tokens: Option<Arc<dashmap::DashMap<u32, Arc<Vec<SynopsisToken>>>>>,
+    /// Optional metadata-segment inverted-index snapshot, set by the
+    /// segment writer before commit (HEAD_SYNOPSIS.md §7). When present,
+    /// commit-time synopsis build prefers this over the doc-tokens
+    /// cache because it covers every live doc — including those carried
+    /// over from prior compactions. Stashed as `RwLock<Option<…>>` so
+    /// `commit(self)` can `take()` it.
+    pub head_synopsis_inverted_index:
+        Arc<tokio::sync::RwLock<Option<InvertedIndexSnapshot>>>,
 }
 
 #[derive(Error, Debug)]
@@ -491,6 +500,7 @@ impl SpannIndexWriter {
         head_synopsis_doc_tokens: Option<
             Arc<dashmap::DashMap<u32, Arc<Vec<SynopsisToken>>>>,
         >,
+        head_synopsis_inverted_index: Arc<tokio::sync::RwLock<Option<InvertedIndexSnapshot>>>,
     ) -> Self {
         SpannIndexWriter {
             hnsw_index,
@@ -517,6 +527,7 @@ impl SpannIndexWriter {
             head_synopsis_top_k_per_key,
             head_synopsis_max_cardinality,
             head_synopsis_doc_tokens,
+            head_synopsis_inverted_index,
         }
     }
 
@@ -831,6 +842,9 @@ impl SpannIndexWriter {
             }
             None => (false, 1, 1, None),
         };
+        let head_synopsis_inverted_index: Arc<
+            tokio::sync::RwLock<Option<InvertedIndexSnapshot>>,
+        > = Arc::new(tokio::sync::RwLock::new(None));
 
         Ok(Self::new(
             hnsw_index,
@@ -854,7 +868,17 @@ impl SpannIndexWriter {
             head_synopsis_top_k_per_key,
             head_synopsis_max_cardinality,
             head_synopsis_doc_tokens,
+            head_synopsis_inverted_index,
         ))
+    }
+
+    /// Hand the SPANN writer a metadata-segment inverted-index snapshot
+    /// to use as the synopsis-build source. Must be called *before*
+    /// `commit()` for the snapshot to take effect; called by the segment
+    /// writer's commit path.
+    pub async fn set_synopsis_inverted_index(&self, snapshot: InvertedIndexSnapshot) {
+        let mut guard = self.head_synopsis_inverted_index.write().await;
+        *guard = Some(snapshot);
     }
 
     async fn load_head_bloom_filters_into(
@@ -2657,17 +2681,19 @@ impl SpannIndexWriter {
         Ok(())
     }
 
-    /// Build the per-head synopsis map by joining live posting lists against
-    /// the cached per-doc structured tokens. A head is omitted entirely if
-    /// any of its live docs has no cached tokens (e.g. loaded from a prior
-    /// segment without a synopsis). Missing entries → gate falls back to
-    /// "keep", so omitting a head is correctness-safe.
+    /// Build the per-head synopsis map. Prefers the metadata-segment
+    /// inverted-index snapshot (HEAD_SYNOPSIS.md §7) if one was set via
+    /// `set_synopsis_inverted_index`; falls back to the per-doc cache
+    /// (§8) otherwise.
+    ///
+    /// The snapshot path is correct under segment reload (every live doc
+    /// is reflected in the metadata inverted index regardless of which
+    /// compaction wrote it). The cache path only sees docs the writer
+    /// touched this commit cycle, so heads with any "untouched" live doc
+    /// are omitted entirely (gate falls back to keep — safe but lossy).
     async fn build_head_synopsis_map(
         &self,
     ) -> Result<HashMap<u32, HeadSynopsis>, SpannIndexWriterError> {
-        let Some(doc_tokens_map) = self.head_synopsis_doc_tokens.as_ref() else {
-            return Ok(HashMap::new());
-        };
         // Live head ids: anything still indexed in HNSW.
         let (non_deleted, _deleted) = {
             let read_guard = self.hnsw_index.inner.read();
@@ -2679,8 +2705,83 @@ impl SpannIndexWriter {
                 SpannIndexWriterError::HnswIndexSearchError(e)
             })?
         };
+
+        // Take the inverted-index snapshot if one is set.
+        let snapshot_opt: Option<InvertedIndexSnapshot> = {
+            let mut guard = self.head_synopsis_inverted_index.write().await;
+            guard.take()
+        };
+
+        if let Some(snapshot) = snapshot_opt {
+            return self
+                .build_synopsis_via_inverted_index(non_deleted, &snapshot)
+                .await;
+        }
+        self.build_synopsis_via_doc_tokens_cache(non_deleted).await
+    }
+
+    /// HEAD_SYNOPSIS.md §7 — recommended production path.
+    async fn build_synopsis_via_inverted_index(
+        &self,
+        non_deleted_heads: Vec<usize>,
+        snapshot: &InvertedIndexSnapshot,
+    ) -> Result<HashMap<u32, HeadSynopsis>, SpannIndexWriterError> {
+        let mut doc_to_heads: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut head_size: HashMap<u32, u64> = HashMap::new();
+        for head_id in non_deleted_heads {
+            let head_id = head_id as u32;
+            let pl = match self
+                .posting_list_writer
+                .get_owned::<u32, &SpannPostingList<'_>>("", head_id)
+                .await
+            {
+                Ok(Some(pl)) => pl,
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(SpannIndexWriterError::PostingListGetError(e));
+                }
+            };
+            let (doc_offset_ids, doc_versions, _) = pl;
+            let mut size: u64 = 0;
+            {
+                let version_map_guard = self.versions_map.read().await;
+                for (doc_id, doc_version) in
+                    doc_offset_ids.iter().zip(doc_versions.iter())
+                {
+                    let current = match version_map_guard.versions_map.get(doc_id) {
+                        Some(v) => *v,
+                        None => continue,
+                    };
+                    if current == 0 || *doc_version < current {
+                        continue;
+                    }
+                    size += 1;
+                    doc_to_heads.entry(*doc_id).or_default().push(head_id);
+                }
+            }
+            head_size.insert(head_id, size);
+        }
+        Ok(build_synopsis_from_inverted_index(
+            &doc_to_heads,
+            head_size,
+            snapshot,
+            self.head_synopsis_top_k_per_key,
+            self.head_synopsis_max_cardinality,
+        ))
+    }
+
+    /// HEAD_SYNOPSIS.md §8 — fallback when no metadata-segment snapshot
+    /// is available (fresh-build benches, ad-hoc usage). Heads with any
+    /// missing-tokens live doc are skipped → gate falls back to keep.
+    async fn build_synopsis_via_doc_tokens_cache(
+        &self,
+        non_deleted_heads: Vec<usize>,
+    ) -> Result<HashMap<u32, HeadSynopsis>, SpannIndexWriterError> {
+        let Some(doc_tokens_map) = self.head_synopsis_doc_tokens.as_ref() else {
+            return Ok(HashMap::new());
+        };
         let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
-        for head_id in non_deleted {
+        for head_id in non_deleted_heads {
             let head_id = head_id as u32;
             let pl = match self
                 .posting_list_writer
@@ -2724,16 +2825,11 @@ impl SpannIndexWriter {
                 }
             }
             if any_miss {
-                // Stale head: any matching doc among the unknowns could be
-                // present. Skip the synopsis entry; gate falls back to keep.
                 continue;
             }
             raw.insert(
                 head_id,
-                HeadRawCounts {
-                    head_size,
-                    counts,
-                },
+                HeadRawCounts { head_size, counts },
             );
         }
         Ok(build_head_synopses(

@@ -391,6 +391,51 @@ impl<'me> MetadataIndexWriter<'me> {
         Ok(())
     }
 
+    /// Re-encode this writer's in-memory inverted index into synopsis
+    /// token format and append it to `snapshot`. Used by the SPANN
+    /// synopsis build path (HEAD_SYNOPSIS.md §7) to read every live
+    /// doc's metadata, including docs carried over from prior
+    /// compactions that the SPANN writer's per-doc-token cache misses.
+    ///
+    /// Float keys are intentionally skipped: the metadata segment
+    /// stores them as `f32`, but synopsis value-tokens use the
+    /// original `f64` bit pattern (see `synopsis_value_token`), and
+    /// the lossy round-trip would produce mismatched tokens. Predicate
+    /// gates on float keys see no synopsis entry and pass through.
+    pub async fn populate_synopsis_snapshot(
+        &self,
+        snapshot: &mut crate::spann::head_synopsis::InvertedIndexSnapshot,
+    ) {
+        match self {
+            MetadataIndexWriter::StringMetadataIndexWriter(_, _, rbms) => {
+                let guard = rbms.lock().await;
+                for (key, by_value) in guard.iter() {
+                    for (value, bitmap) in by_value.iter() {
+                        snapshot.insert_str(key, value, bitmap.clone());
+                    }
+                }
+            }
+            MetadataIndexWriter::U32MetadataIndexWriter(_, _, rbms) => {
+                let guard = rbms.lock().await;
+                for (key, by_value) in guard.iter() {
+                    for (value, bitmap) in by_value.iter() {
+                        snapshot.insert_int(key, *value, bitmap.clone());
+                    }
+                }
+            }
+            MetadataIndexWriter::BoolMetadataIndexWriter(_, _, rbms) => {
+                let guard = rbms.lock().await;
+                for (key, by_value) in guard.iter() {
+                    for (value, bitmap) in by_value.iter() {
+                        snapshot.insert_bool(key, *value, bitmap.clone());
+                    }
+                }
+            }
+            // f32 intentionally skipped — see method-level comment.
+            MetadataIndexWriter::F32MetadataIndexWriter(_, _, _) => {}
+        }
+    }
+
     pub async fn commit(self) -> Result<MetadataIndexFlusher, MetadataIndexError> {
         match self {
             MetadataIndexWriter::StringMetadataIndexWriter(blockfile_writer, _, _) => {

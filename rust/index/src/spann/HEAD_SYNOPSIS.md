@@ -496,9 +496,30 @@ commit time. There are two ways to wire this:
    SPANN segment's `file_path`. More complex but decouples the
    writers.
 
-Option 1 is recommended for the MVP. The compactor already
-orchestrates both writers in lockstep; adding an argument is a
-small change.
+Option 1 is **implemented**. See `commit_with_metadata_snapshot` on
+`SpannSegmentWriterShard`, `snapshot_inverted_index_for_synopsis` on
+`MetadataSegmentWriterShard`, and `set_synopsis_inverted_index` on
+`SpannIndexWriter`. The compactor calls
+`spann_writer.commit_with_metadata_snapshot(&metadata_shard)` which:
+
+1. Snapshots the metadata segment's typed inverted indexes
+   (`String`/`U32`/`Bool` — float keys are intentionally skipped per
+   §11) into an `InvertedIndexSnapshot { by_key: key → value_token →
+   bitmap<doc_id> }`.
+2. Hands that snapshot to the SPANN writer via
+   `set_synopsis_inverted_index`.
+3. Calls the regular `commit()`, which detects the snapshot is set
+   and dispatches to `build_synopsis_via_inverted_index` instead of
+   the doc-tokens cache fallback in §8.
+
+The snapshot path is correct under segment reload: every live doc
+appears in the metadata inverted index regardless of which
+compaction wrote it. The §8 fallback only sees docs the SPANN writer
+touched this commit cycle, so heads with any "untouched" live doc
+are skipped (gate falls back to keep — safe but lossy). Empirical
+parity validated in `LOGS_PLANS/synopsis-recall-study.md`: both
+build paths produce equivalent drop_ratio (~0.69) and iso-I/O
+Δrecall (+0.35–0.43) with `bad_drops = 0`.
 
 ---
 

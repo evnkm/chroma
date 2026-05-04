@@ -4,6 +4,7 @@ use chroma_types::{
     SetOperator, Where,
 };
 use dashmap::DashMap;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -535,6 +536,131 @@ pub fn apply_top_k_capping(
     build_head_synopses(raw, top_k_per_key, max_cardinality)
 }
 
+// ---------------------------------------------------------------------------
+// Metadata-segment-driven build path (HEAD_SYNOPSIS.md §7).
+//
+// The cache-driven path (above) builds synopses from the SPANN writer's own
+// per-doc structured token cache. That cache only contains docs the writer
+// touched this commit cycle — fine for fresh-build benches but incomplete
+// for production segment-reload scenarios where the prior segment's docs
+// have no cached tokens. Heads with any "missing-tokens" doc are skipped.
+//
+// The inverted-index path uses the metadata segment's typed inverted
+// indexes as the source of truth — every live doc's metadata is reflected
+// regardless of which compaction cycle wrote it. The metadata segment's
+// per-key bitmaps are joined against an inverted SPANN posting list
+// (`doc_id → head_ids` via `write_nprobe` replication) to count how many
+// docs in each head match each (key, value) pair.
+//
+// Token format compatibility: the metadata segment stores ints as `u32`
+// (lossy cast from `MetadataValue::Int(i64)`) and floats as `f32`. The
+// snapshot below tokenizes from the segment's storage view, so it is
+// round-trip-correct for `MetadataValue::Int` values that fit in u32 and
+// `MetadataValue::Bool`/`Str`. Float keys are *intentionally omitted* from
+// the snapshot — `f32` precision can't recover the cache path's
+// `f64.to_bits()` token, and the gate's "missing key" fallback to "keep"
+// is safer than presenting a mismatched key. Predicates on float keys
+// will see no synopsis entry and pass through.
+// ---------------------------------------------------------------------------
+
+/// A snapshot of a metadata segment shard's typed inverted indexes,
+/// re-encoded into synopsis-format tokens. Built by the metadata segment
+/// writer at commit time and handed to the SPANN writer.
+#[derive(Debug, Default)]
+pub struct InvertedIndexSnapshot {
+    /// `metadata_key → value_token → bitmap_of_doc_offset_ids`.
+    pub by_key: HashMap<String, HashMap<String, RoaringBitmap>>,
+}
+
+impl InvertedIndexSnapshot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a u32 metadata entry, encoded as `int::<u32-as-i64>`.
+    /// (Matches `synopsis_value_token(MetadataValue::Int(n as i64))`
+    /// when `0 ≤ n < 2^32`.)
+    pub fn insert_int(&mut self, key: &str, value: u32, bitmap: RoaringBitmap) {
+        let tok = format!("int::{}", value as i64);
+        self.by_key
+            .entry(key.to_string())
+            .or_default()
+            .insert(tok, bitmap);
+    }
+
+    pub fn insert_str(&mut self, key: &str, value: &str, bitmap: RoaringBitmap) {
+        let tok = format!("str::{}", value);
+        self.by_key
+            .entry(key.to_string())
+            .or_default()
+            .insert(tok, bitmap);
+    }
+
+    pub fn insert_bool(&mut self, key: &str, value: bool, bitmap: RoaringBitmap) {
+        let tok = format!("bool::{}", value);
+        self.by_key
+            .entry(key.to_string())
+            .or_default()
+            .insert(tok, bitmap);
+    }
+
+    pub fn distinct_keys(&self) -> usize {
+        self.by_key.len()
+    }
+}
+
+/// Build per-head synopses by joining a SPANN posting-list inversion
+/// (`doc_id → head_ids`) against an `InvertedIndexSnapshot`. Each `(key,
+/// value)` bitmap is walked once and contributes to each head that
+/// contains each member doc.
+///
+/// `head_size` is the number of live docs per head — must include every
+/// head that appears in `doc_to_heads` even if no metadata covers it.
+/// Heads not in `head_size` are omitted entirely from the output (gate
+/// falls back to "keep").
+///
+/// Cost: `O(Σ_(k,v) bitmap_size + total_docs × avg_replicas)`.
+pub fn build_synopsis_from_inverted_index(
+    doc_to_heads: &HashMap<u32, Vec<u32>>,
+    head_size: HashMap<u32, u64>,
+    snapshot: &InvertedIndexSnapshot,
+    top_k_per_key: u32,
+    max_cardinality: u32,
+) -> HashMap<u32, HeadSynopsis> {
+    let mut raw: HashMap<u32, HeadRawCounts> = HashMap::with_capacity(head_size.len());
+    for (head_id, size) in head_size {
+        raw.insert(
+            head_id,
+            HeadRawCounts {
+                head_size: size,
+                counts: HashMap::new(),
+            },
+        );
+    }
+
+    for (key, by_v) in &snapshot.by_key {
+        for (value_token, bitmap) in by_v {
+            for doc_id in bitmap.iter() {
+                let Some(heads) = doc_to_heads.get(&doc_id) else {
+                    continue;
+                };
+                for &head_id in heads {
+                    let Some(rc) = raw.get_mut(&head_id) else {
+                        continue;
+                    };
+                    *rc.counts
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(value_token.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    build_head_synopses(raw, top_k_per_key, max_cardinality)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +1091,122 @@ mod tests {
         let s = out.get(&1).unwrap();
         assert_eq!(s.counts["k"].len(), 3);
         assert!(s.other_counts.get("k").copied().unwrap_or(0) == 0);
+    }
+
+    #[test]
+    fn inverted_index_build_matches_cache_build_for_same_input() {
+        // Two heads, three docs each, "bucket" key with values 0/1.
+        // Cache build: feed structured tokens directly.
+        // Inverted-index build: feed equivalent bitmaps via snapshot.
+        // Both should produce identical synopses.
+        let mut cache_raw: HashMap<u32, HeadRawCounts> = HashMap::new();
+        let mut h1 = HeadRawCounts { head_size: 3, counts: HashMap::new() };
+        h1.counts
+            .entry("bucket".to_string())
+            .or_default()
+            .extend(vec![("int::0".to_string(), 2u64), ("int::1".to_string(), 1u64)]);
+        cache_raw.insert(1, h1);
+        let mut h2 = HeadRawCounts { head_size: 3, counts: HashMap::new() };
+        h2.counts
+            .entry("bucket".to_string())
+            .or_default()
+            .extend(vec![("int::1".to_string(), 3u64)]);
+        cache_raw.insert(2, h2);
+        let cache_built = build_head_synopses(cache_raw, 64, 1024);
+
+        // Now: same data, but expressed as doc_to_heads + inverted index.
+        // Doc layout: doc 1, 2 in head 1 with bucket=0; doc 3 in head 1 with
+        //             bucket=1; docs 4, 5, 6 in head 2 with bucket=1.
+        let mut doc_to_heads: HashMap<u32, Vec<u32>> = HashMap::new();
+        doc_to_heads.insert(1, vec![1]);
+        doc_to_heads.insert(2, vec![1]);
+        doc_to_heads.insert(3, vec![1]);
+        doc_to_heads.insert(4, vec![2]);
+        doc_to_heads.insert(5, vec![2]);
+        doc_to_heads.insert(6, vec![2]);
+        let mut head_size: HashMap<u32, u64> = HashMap::new();
+        head_size.insert(1, 3);
+        head_size.insert(2, 3);
+        let mut snap = InvertedIndexSnapshot::new();
+        let mut bm0 = RoaringBitmap::new();
+        bm0.insert(1);
+        bm0.insert(2);
+        snap.insert_int("bucket", 0, bm0);
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(3);
+        bm1.insert(4);
+        bm1.insert(5);
+        bm1.insert(6);
+        snap.insert_int("bucket", 1, bm1);
+
+        let inv_built = build_synopsis_from_inverted_index(
+            &doc_to_heads,
+            head_size,
+            &snap,
+            64,
+            1024,
+        );
+
+        // Compare per-head: head_size, counts, other_counts.
+        for hid in [1u32, 2u32] {
+            let a = cache_built.get(&hid).expect("cache head present");
+            let b = inv_built.get(&hid).expect("inverted head present");
+            assert_eq!(a.head_size, b.head_size, "head {} head_size mismatch", hid);
+            assert_eq!(a.counts, b.counts, "head {} counts mismatch", hid);
+            assert_eq!(
+                a.other_counts, b.other_counts,
+                "head {} other_counts mismatch",
+                hid
+            );
+        }
+    }
+
+    #[test]
+    fn inverted_index_build_handles_replicated_docs() {
+        // Doc 1 in heads 1 AND 2 (write_nprobe replication). Bucket=0.
+        // Both heads should count doc 1 once.
+        let mut doc_to_heads: HashMap<u32, Vec<u32>> = HashMap::new();
+        doc_to_heads.insert(1, vec![1, 2]);
+        let mut head_size: HashMap<u32, u64> = HashMap::new();
+        head_size.insert(1, 1);
+        head_size.insert(2, 1);
+        let mut snap = InvertedIndexSnapshot::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        snap.insert_int("bucket", 0, bm);
+        let out = build_synopsis_from_inverted_index(
+            &doc_to_heads,
+            head_size,
+            &snap,
+            64,
+            1024,
+        );
+        assert_eq!(out.get(&1).unwrap().counts["bucket"]["int::0"], 1);
+        assert_eq!(out.get(&2).unwrap().counts["bucket"]["int::0"], 1);
+    }
+
+    #[test]
+    fn inverted_index_build_skips_docs_not_in_doc_to_heads() {
+        // Doc 99 in the snapshot but not in doc_to_heads (e.g., deleted).
+        // Should not contribute to any head.
+        let mut doc_to_heads: HashMap<u32, Vec<u32>> = HashMap::new();
+        doc_to_heads.insert(1, vec![1]);
+        let mut head_size: HashMap<u32, u64> = HashMap::new();
+        head_size.insert(1, 1);
+        let mut snap = InvertedIndexSnapshot::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        bm.insert(99);
+        snap.insert_int("bucket", 0, bm);
+        let out = build_synopsis_from_inverted_index(
+            &doc_to_heads,
+            head_size,
+            &snap,
+            64,
+            1024,
+        );
+        // Only doc 1 contributes — count is 1, not 2.
+        assert_eq!(out.get(&1).unwrap().counts["bucket"]["int::0"], 1);
     }
 
     #[test]

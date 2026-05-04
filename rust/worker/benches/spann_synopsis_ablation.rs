@@ -52,7 +52,8 @@ use chroma_index::{
     hnsw_provider::HnswIndexProvider,
     spann::{
         head_synopsis::{
-            HeadSynopsisReadConfig, HeadSynopsisWriteConfig, SynopsisPredicate, SynopsisToken,
+            HeadSynopsisReadConfig, HeadSynopsisWriteConfig, InvertedIndexSnapshot,
+            SynopsisPredicate, SynopsisToken,
         },
         types::{GarbageCollectionContext, SpannIndexReader, SpannIndexWriter, SpannMetrics},
         utils::rng_query,
@@ -103,6 +104,28 @@ struct BuiltIndex<'a> {
     synopsis_path: Option<String>,
 }
 
+/// Selects which synopsis-build path the bench exercises. The metadata
+/// path is the one production code uses (HEAD_SYNOPSIS.md §7); the cache
+/// path is the SPANN-side fallback (§8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BuildPath {
+    Cache,
+    Metadata,
+}
+
+impl BuildPath {
+    fn from_env() -> Self {
+        match std::env::var("BENCH_SYNOPSIS_BUILD")
+            .unwrap_or_else(|_| "cache".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "metadata" | "inverted" | "snapshot" => BuildPath::Metadata,
+            _ => BuildPath::Cache,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_index(
     storage: Storage,
@@ -114,6 +137,7 @@ async fn build_index(
     synopsis_enabled: bool,
     top_k_per_key: u32,
     max_cardinality: u32,
+    build_path: BuildPath,
 ) -> BuiltIndex<'static> {
     let block_cache = new_cache_for_test();
     let sparse_index_cache = new_cache_for_test();
@@ -172,18 +196,23 @@ async fn build_index(
     .expect("spann writer");
 
     eprintln!(
-        "[setup] building SPANN index (synopsis={}, n={}, buckets={})",
+        "[setup] building SPANN index (synopsis={}, build_path={:?}, n={}, buckets={})",
         synopsis_enabled,
+        build_path,
         records.len(),
         n_buckets
     );
     let t = Instant::now();
     for (i, (id, record)) in records.iter().enumerate() {
-        let synopsis_tokens: Vec<SynopsisToken> = if synopsis_enabled {
-            vec![("bucket".to_string(), format!("int::{}", record_buckets[i]))]
-        } else {
-            Vec::new()
-        };
+        // For Cache build path: feed structured tokens via add_with_…_synopsis.
+        // For Metadata build path: skip per-doc tokens; we'll provide a
+        // pre-built InvertedIndexSnapshot instead.
+        let synopsis_tokens: Vec<SynopsisToken> =
+            if synopsis_enabled && build_path == BuildPath::Cache {
+                vec![("bucket".to_string(), format!("int::{}", record_buckets[i]))]
+            } else {
+                Vec::new()
+            };
         writer
             .add_with_metadata_tokens_and_synopsis(
                 *id,
@@ -195,6 +224,26 @@ async fn build_index(
             .expect("add record");
     }
     eprintln!("[setup] adds done in {:.1}s", t.elapsed().as_secs_f64());
+
+    // Metadata build path: hand the writer a synthetic InvertedIndexSnapshot
+    // built from the bench's known buckets. This is what the production
+    // commit_with_metadata_snapshot path does, just without going through
+    // a real MetadataSegmentWriterShard. Functionally equivalent.
+    if synopsis_enabled && build_path == BuildPath::Metadata {
+        let mut snap = InvertedIndexSnapshot::new();
+        let mut by_bucket: std::collections::HashMap<u32, RoaringBitmap> =
+            std::collections::HashMap::new();
+        for (i, (id, _)) in records.iter().enumerate() {
+            by_bucket
+                .entry(record_buckets[i])
+                .or_default()
+                .insert(*id);
+        }
+        for (bucket, bm) in by_bucket {
+            snap.insert_int("bucket", bucket, bm);
+        }
+        writer.set_synopsis_inverted_index(snap).await;
+    }
 
     let flusher = Box::pin(writer.commit()).await.expect("commit");
     let paths = Box::pin(flusher.flush()).await.expect("flush");
@@ -438,6 +487,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rng_epsilon = params.search_rng_epsilon;
     let rng_factor = params.search_rng_factor;
 
+    let build_path = BuildPath::from_env();
+
     let idx_000 = build_index(
         storage_000,
         &records,
@@ -448,6 +499,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         false,
         top_k_per_key,
         max_cardinality,
+        build_path,
     )
     .await;
 
@@ -461,6 +513,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         true,
         top_k_per_key,
         max_cardinality,
+        build_path,
     )
     .await;
     eprintln!(

@@ -1210,6 +1210,31 @@ impl<'me> MetadataSegmentWriterShard<'me> {
         Ok(if schema_modified { schema } else { None })
     }
 
+    /// Snapshot the in-memory typed inverted indexes into a synopsis-format
+    /// `InvertedIndexSnapshot`. Used by the SPANN segment writer's commit
+    /// path to feed the synopsis build with every live doc's metadata —
+    /// including docs from prior compactions that the SPANN writer's
+    /// per-doc-token cache misses.
+    ///
+    /// Must be called *before* `finish()` flushes the writers, since the
+    /// `uncommitted_rbms` are consumed at flush time. Float metadata is
+    /// intentionally skipped — see `MetadataIndexWriter::populate_synopsis_snapshot`.
+    pub async fn snapshot_inverted_index_for_synopsis(
+        &self,
+    ) -> chroma_index::spann::head_synopsis::InvertedIndexSnapshot {
+        let mut snap = chroma_index::spann::head_synopsis::InvertedIndexSnapshot::new();
+        if let Some(w) = &self.string_metadata_index_writer {
+            w.populate_synopsis_snapshot(&mut snap).await;
+        }
+        if let Some(w) = &self.u32_metadata_index_writer {
+            w.populate_synopsis_snapshot(&mut snap).await;
+        }
+        if let Some(w) = &self.bool_metadata_index_writer {
+            w.populate_synopsis_snapshot(&mut snap).await;
+        }
+        snap
+    }
+
     pub async fn finish(&mut self) -> Result<(), Box<dyn ChromaError>> {
         let mut full_text_index_writer = match self.full_text_index_writer.take() {
             Some(writer) => writer,
@@ -1646,6 +1671,90 @@ mod test {
     use roaring::RoaringBitmap;
     use std::{collections::HashMap, str::FromStr};
     use tokio::runtime::Runtime;
+
+    #[tokio::test]
+    async fn snapshot_inverted_index_for_synopsis_uses_synopsis_token_format() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
+        let block_cache = new_cache_for_test();
+        let sparse_index_cache = new_cache_for_test();
+        let arrow_blockfile_provider = ArrowBlockfileProvider::new(
+            storage,
+            TEST_MAX_BLOCK_SIZE_BYTES,
+            block_cache,
+            sparse_index_cache,
+            BlockManagerConfig::default_num_concurrent_block_flushes(),
+            BlockManagerConfig::default_max_concurrent_block_loads(),
+        );
+        let blockfile_provider =
+            BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
+        let tenant = "test_tenant";
+        let database_id = DatabaseUuid::new();
+        let metadata_segment = chroma_types::Segment {
+            id: SegmentUuid::new(),
+            r#type: chroma_types::SegmentType::BlockfileMetadata,
+            scope: chroma_types::SegmentScope::METADATA,
+            collection: CollectionUuid::new(),
+            metadata: None,
+            file_path: HashMap::new(),
+        };
+        let metadata_shard =
+            SegmentShard::try_from((&metadata_segment, 0)).expect("valid shard");
+        let metadata_writer = MetadataSegmentWriterShard::from_segment(
+            tenant,
+            &database_id,
+            &metadata_shard,
+            &blockfile_provider,
+            None,
+        )
+        .await
+        .expect("metadata writer");
+
+        // Insert a few typed values: int (bucket), string (color), bool (active).
+        // doc 1: bucket=0, color=red, active=true
+        // doc 2: bucket=1, color=blue, active=false
+        // doc 3: bucket=0, color=red, active=true
+        for (oid, key, val) in [
+            (1u32, "bucket", MetadataValue::Int(0)),
+            (1, "color", MetadataValue::Str("red".into())),
+            (1, "active", MetadataValue::Bool(true)),
+            (2, "bucket", MetadataValue::Int(1)),
+            (2, "color", MetadataValue::Str("blue".into())),
+            (2, "active", MetadataValue::Bool(false)),
+            (3, "bucket", MetadataValue::Int(0)),
+            (3, "color", MetadataValue::Str("red".into())),
+            (3, "active", MetadataValue::Bool(true)),
+        ] {
+            metadata_writer
+                .set_metadata(key, &val, oid)
+                .await
+                .expect("set_metadata");
+        }
+
+        let snap = metadata_writer
+            .snapshot_inverted_index_for_synopsis()
+            .await;
+
+        // Token format must match what synopsis_value_token produces:
+        //   int   → "int::<value>"
+        //   str   → "str::<value>"
+        //   bool  → "bool::<value>"
+        // bucket=0 → docs 1, 3
+        let bucket_0 = &snap.by_key["bucket"]["int::0"];
+        assert_eq!(bucket_0.iter().collect::<Vec<_>>(), vec![1u32, 3]);
+        // bucket=1 → doc 2
+        let bucket_1 = &snap.by_key["bucket"]["int::1"];
+        assert_eq!(bucket_1.iter().collect::<Vec<_>>(), vec![2u32]);
+        // color=red → docs 1, 3
+        let red = &snap.by_key["color"]["str::red"];
+        assert_eq!(red.iter().collect::<Vec<_>>(), vec![1u32, 3]);
+        // color=blue → doc 2
+        let blue = &snap.by_key["color"]["str::blue"];
+        assert_eq!(blue.iter().collect::<Vec<_>>(), vec![2u32]);
+        // active=true → docs 1, 3
+        let active_true = &snap.by_key["active"]["bool::true"];
+        assert_eq!(active_true.iter().collect::<Vec<_>>(), vec![1u32, 3]);
+    }
 
     #[tokio::test]
     async fn empty_blocks() {
