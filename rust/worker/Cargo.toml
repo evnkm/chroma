@@ -127,3 +127,7 @@ harness = false
 [[bench]]
 name = "spann_synopsis_ablation"
 harness = false
+
+[[bench]]
+name = "spann_full_sweep"
+harness = false
