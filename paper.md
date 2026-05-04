@@ -1,6 +1,6 @@
 # Filtered ANN at scale: a 4-way ablation of probe, bloom, and synopsis gates in SPANN
 
-**Author:** Zach Marinov  •  **Course:** 6.5830 (Spring 2026)  •  **Repo:** Chroma fork (`everything-in-one` branch)
+**Authors:** Zach Marinov, Kartik Pingle, Evan Kim •  **Course:** 6.5830 (Spring 2026)  •  **Repo:** Chroma fork (`everything-in-one` branch)
 **Bench:** [`rust/worker/benches/spann_full_sweep.rs`](rust/worker/benches/spann_full_sweep.rs) • **Raw data:** [`LOGS_PLANS/benchmarks/full_sweep/`](LOGS_PLANS/benchmarks/full_sweep/)
 
 ## Abstract
