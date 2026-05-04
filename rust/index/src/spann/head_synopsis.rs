@@ -422,17 +422,38 @@ pub struct HeadRawCounts {
     pub counts: HashMap<String, HashMap<String, u64>>,
 }
 
-/// Apply per-key top-K capping and max-cardinality skipping to a set of
-/// raw per-head counts. Mutates `raw` in place to produce the final
-/// `HeadSynopsis` map.
+/// Compress raw per-head counts into per-head synopses with **per-key
+/// auto-promotion**: low-/medium-cardinality keys are tracked exactly,
+/// high-cardinality keys fall back to top-K + other.
 ///
-/// Algorithm:
-/// 1. Aggregate global popularity per (key, value): sum across heads.
-/// 2. Count distinct values per key. If `> max_cardinality`, drop the
-///    key entirely from every head.
-/// 3. Otherwise, keep the top-K most popular values per key. Sum the
-///    counts of dropped values into `other_counts[key]` per head.
-pub fn apply_top_k_capping(
+/// Two regimes per key, based on *global* distinct-value count:
+///
+/// 1. `distinct_values ≤ max_cardinality`: **track all values exactly**.
+///    No `other_counts` pollution; the gate is exact for every queried
+///    value of this key. This is the common case for typed metadata —
+///    booleans, enums, low/medium-cardinality categoricals (tags,
+///    languages, status codes, popular IDs).
+///
+/// 2. `distinct_values > max_cardinality`: **top-K + other-bucket**.
+///    Storage-bounded; precision degrades for non-top-K queries (gate
+///    falls back to "keep" via the `other_counts > 0` path). This is
+///    the high-cardinality case (UUIDs, free-form text); the bloom
+///    filter is the better fit here, but the synopsis still gates
+///    cleanly when the queried value happens to be in top-K.
+///
+/// Why auto-promotion? The earlier policy (always cap at `top_k_per_key`,
+/// even if the key has only slightly more distinct values than `top_k`)
+/// caused near-universal "other-bucket pollution": with default
+/// `top_k=64` and a workload of, say, 100 distinct values, ~99% of
+/// heads ended up with `other_counts[key] > 0`, forcing the gate to
+/// return "unknown" for every query and silently degrading to a no-op.
+/// See `LOGS_PLANS/synopsis-recall-study.md` "Skepticism / caveats" for
+/// the empirical write-up of that trap.
+///
+/// Under auto-promotion, `top_k_per_key` only kicks in for keys that
+/// genuinely exceed `max_cardinality` — exactly the keys where
+/// compression is needed.
+pub fn build_head_synopses(
     raw: HashMap<u32, HeadRawCounts>,
     top_k_per_key: u32,
     max_cardinality: u32,
@@ -448,32 +469,23 @@ pub fn apply_top_k_capping(
         }
     }
 
-    // Step 2 — pick allowed top-K values per key (or skip the key entirely).
+    // Step 2 — pick allowed values per key (auto-promotion logic).
     let mut top_set: HashMap<String, HashMap<String, ()>> = HashMap::new();
-    let mut skipped_keys: HashMap<String, ()> = HashMap::new();
     for (k, by_v) in &global {
-        if by_v.len() as u32 > max_cardinality {
-            skipped_keys.insert(k.clone(), ());
-            continue;
-        }
-        if (by_v.len() as u32) <= top_k_per_key {
-            // All values fit — keep them all.
-            let allowed = by_v.keys().cloned().map(|v| (v, ())).collect();
-            top_set.insert(k.clone(), allowed);
+        let allowed: HashMap<String, ()> = if (by_v.len() as u32) <= max_cardinality {
+            // Regime 1: low/medium card — track all exactly.
+            by_v.keys().cloned().map(|v| (v, ())).collect()
         } else {
-            // Pick top-K by popularity.
+            // Regime 2: high card — top-K + other.
             let mut entries: Vec<(&String, &u64)> = by_v.iter().collect();
-            entries.sort_by(|a, b| {
-                b.1.cmp(a.1)
-                    .then_with(|| a.0.cmp(b.0))
-            });
-            let allowed = entries
+            entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            entries
                 .into_iter()
                 .take(top_k_per_key as usize)
                 .map(|(v, _)| (v.clone(), ()))
-                .collect();
-            top_set.insert(k.clone(), allowed);
-        }
+                .collect()
+        };
+        top_set.insert(k.clone(), allowed);
     }
 
     // Step 3 — emit per-head synopses.
@@ -482,9 +494,6 @@ pub fn apply_top_k_capping(
         let mut counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
         let mut other_counts: HashMap<String, u64> = HashMap::new();
         for (k, by_v) in raw_head.counts {
-            if skipped_keys.contains_key(&k) {
-                continue;
-            }
             let Some(allowed) = top_set.get(&k) else {
                 continue;
             };
@@ -514,6 +523,16 @@ pub fn apply_top_k_capping(
         );
     }
     out
+}
+
+/// Deprecated alias for backward compatibility — prefer `build_head_synopses`.
+#[doc(hidden)]
+pub fn apply_top_k_capping(
+    raw: HashMap<u32, HeadRawCounts>,
+    top_k_per_key: u32,
+    max_cardinality: u32,
+) -> HashMap<u32, HeadSynopsis> {
+    build_head_synopses(raw, top_k_per_key, max_cardinality)
 }
 
 #[cfg(test)]
@@ -847,21 +866,13 @@ mod tests {
     }
 
     #[test]
-    fn top_k_capping_keeps_only_most_popular_values_globally() {
-        // Two heads. Key "bucket" has values 0..5 globally; top-K=2 should
-        // keep the two values with highest total count (popular) and roll
-        // the rest into other_counts per head.
+    fn auto_promotion_tracks_all_when_distinct_le_max_cardinality() {
+        // Two heads with 5 distinct global values. `top_k=2`, `max_card=1024`:
+        // since 5 ≤ max_card, auto-promotion keeps everything exactly even
+        // though 5 > top_k. No `other_counts` pollution.
         let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
-        let mut h1 = HeadRawCounts {
-            head_size: 10,
-            counts: HashMap::new(),
-        };
-        let mut h2 = HeadRawCounts {
-            head_size: 10,
-            counts: HashMap::new(),
-        };
-        // Globally: int::0 → 7 total (popular), int::1 → 5 total (popular),
-        //           int::2 → 3, int::3 → 2, int::4 → 1.
+        let mut h1 = HeadRawCounts { head_size: 10, counts: HashMap::new() };
+        let mut h2 = HeadRawCounts { head_size: 10, counts: HashMap::new() };
         h1.counts
             .entry("bucket".to_string())
             .or_default()
@@ -881,9 +892,52 @@ mod tests {
             ]);
         raw.insert(1, h1);
         raw.insert(2, h2);
-        let out = apply_top_k_capping(raw, 2, 1024);
+        // top_k=2 would normally cap, but max_card=1024 >> 5 distinct ⇒ exact.
+        let out = build_head_synopses(raw, 2, 1024);
         let s1 = out.get(&1).unwrap();
-        // Top-K kept: int::0, int::1.
+        assert_eq!(s1.counts["bucket"].get("int::0").copied(), Some(4));
+        assert_eq!(s1.counts["bucket"].get("int::1").copied(), Some(3));
+        assert_eq!(s1.counts["bucket"].get("int::2").copied(), Some(2));
+        assert_eq!(s1.counts["bucket"].get("int::4").copied(), Some(1));
+        // No "other" pollution under auto-promotion.
+        assert!(!s1.other_counts.contains_key("bucket"));
+        let s2 = out.get(&2).unwrap();
+        assert_eq!(s2.counts["bucket"].get("int::0").copied(), Some(3));
+        assert_eq!(s2.counts["bucket"].get("int::3").copied(), Some(2));
+        assert!(!s2.other_counts.contains_key("bucket"));
+    }
+
+    #[test]
+    fn high_cardinality_keys_compress_to_top_k_plus_other() {
+        // Forces high-cardinality regime by setting max_cardinality < distinct.
+        // 5 distinct values, max_card=2, top_k=2 ⇒ compress to top-2 + other.
+        let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
+        let mut h1 = HeadRawCounts { head_size: 10, counts: HashMap::new() };
+        let mut h2 = HeadRawCounts { head_size: 10, counts: HashMap::new() };
+        // Globally: int::0 → 7 total (popular), int::1 → 5, int::2 → 2,
+        //           int::3 → 2, int::4 → 1.
+        h1.counts
+            .entry("bucket".to_string())
+            .or_default()
+            .extend(vec![
+                ("int::0".to_string(), 4u64),
+                ("int::1".to_string(), 3u64),
+                ("int::2".to_string(), 2u64),
+                ("int::4".to_string(), 1u64),
+            ]);
+        h2.counts
+            .entry("bucket".to_string())
+            .or_default()
+            .extend(vec![
+                ("int::0".to_string(), 3u64),
+                ("int::1".to_string(), 2u64),
+                ("int::3".to_string(), 2u64),
+            ]);
+        raw.insert(1, h1);
+        raw.insert(2, h2);
+        let out = build_head_synopses(raw, 2, 2);
+        let s1 = out.get(&1).unwrap();
+        // Top-K kept: int::0, int::1 (most popular globally).
         assert_eq!(s1.counts["bucket"].get("int::0").copied(), Some(4));
         assert_eq!(s1.counts["bucket"].get("int::1").copied(), Some(3));
         assert!(!s1.counts["bucket"].contains_key("int::2"));
@@ -892,37 +946,52 @@ mod tests {
         let s2 = out.get(&2).unwrap();
         assert_eq!(s2.counts["bucket"].get("int::0").copied(), Some(3));
         assert_eq!(s2.counts["bucket"].get("int::1").copied(), Some(2));
-        // int::3 → other.
         assert_eq!(s2.other_counts.get("bucket").copied(), Some(2));
     }
 
     #[test]
-    fn max_cardinality_skips_keys_above_threshold() {
+    fn auto_promotion_at_exact_threshold_still_tracks_all() {
+        // distinct == max_cardinality (boundary): track all exactly.
         let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
-        let mut h1 = HeadRawCounts {
-            head_size: 5,
-            counts: HashMap::new(),
-        };
-        // Three distinct values for "huge" — exceeds max_cardinality=2.
-        h1.counts
-            .entry("huge".to_string())
-            .or_default()
-            .extend(vec![
-                ("str::a".to_string(), 1u64),
-                ("str::b".to_string(), 1u64),
-                ("str::c".to_string(), 3u64),
-            ]);
+        let mut h1 = HeadRawCounts { head_size: 3, counts: HashMap::new() };
+        h1.counts.entry("k".to_string()).or_default().extend(vec![
+            ("v::a".to_string(), 1u64),
+            ("v::b".to_string(), 1u64),
+            ("v::c".to_string(), 1u64),
+        ]);
+        raw.insert(1, h1);
+        // 3 distinct, max_card=3 ⇒ exact.
+        let out = build_head_synopses(raw, 1, 3);
+        let s = out.get(&1).unwrap();
+        assert_eq!(s.counts["k"].len(), 3);
+        assert!(s.other_counts.get("k").copied().unwrap_or(0) == 0);
+    }
+
+    #[test]
+    fn high_card_keys_no_longer_skipped_entirely() {
+        // 3 distinct, max_card=2 ⇒ compressed mode, NOT skipped.
+        // Verifies the regime change: high-card keys retain a partial
+        // synopsis (top-K + other) rather than being dropped entirely.
+        let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
+        let mut h1 = HeadRawCounts { head_size: 5, counts: HashMap::new() };
+        h1.counts.entry("huge".to_string()).or_default().extend(vec![
+            ("str::a".to_string(), 1u64),
+            ("str::b".to_string(), 1u64),
+            ("str::c".to_string(), 3u64),
+        ]);
         h1.counts
             .entry("small".to_string())
             .or_default()
             .insert("str::x".to_string(), 5u64);
         raw.insert(1, h1);
-        let out = apply_top_k_capping(raw, 64, 2);
+        let out = build_head_synopses(raw, 2, 2);
         let s1 = out.get(&1).unwrap();
-        // "huge" skipped entirely.
-        assert!(!s1.counts.contains_key("huge"));
-        assert!(!s1.other_counts.contains_key("huge"));
-        // "small" preserved.
+        // "huge" present in top-K mode.
+        assert!(s1.counts.contains_key("huge"));
+        assert_eq!(s1.counts["huge"].len(), 2); // top-2
+        // The 3rd value was compressed into other.
+        assert!(s1.other_counts.get("huge").copied().unwrap_or(0) > 0);
+        // "small" still tracked exactly.
         assert_eq!(s1.counts["small"].get("str::x").copied(), Some(5));
     }
 }

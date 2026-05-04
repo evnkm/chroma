@@ -40,7 +40,7 @@ use crate::{
         HeadBloomReadConfig, HeadBloomWriteConfig,
     },
     spann::head_synopsis::{
-        self, apply_top_k_capping, HeadRawCounts, HeadSynopsis, HeadSynopsisBlob,
+        self, build_head_synopses, HeadRawCounts, HeadSynopsis, HeadSynopsisBlob,
         HeadSynopsisBlobFlusher, HeadSynopsisCache, HeadSynopsisReadConfig,
         HeadSynopsisWriteConfig, SynopsisPredicate, SynopsisToken,
     },
@@ -2736,7 +2736,7 @@ impl SpannIndexWriter {
                 },
             );
         }
-        Ok(apply_top_k_capping(
+        Ok(build_head_synopses(
             raw,
             self.head_synopsis_top_k_per_key,
             self.head_synopsis_max_cardinality,

@@ -644,54 +644,85 @@ passes through `center_ids` unchanged.
 
 ## 10. Cardinality control
 
-Two knobs:
+Two knobs, applied **per-key with auto-promotion**: the regime is
+chosen based on the key's global distinct-value count, not on a
+single global cap.
+
+### Regimes
+
+For each key independently:
+
+- **Low/medium cardinality** (`distinct_values ≤ max_cardinality`):
+  track all values exactly. The gate is exact for every queried
+  value of this key — no `other_counts` pollution. This is the
+  common case for typed metadata: booleans, enums, low/medium-card
+  categoricals (tags, languages, status codes, popular IDs).
+- **High cardinality** (`distinct_values > max_cardinality`):
+  compress to top-K + other. Storage-bounded; gate is exact for
+  queried values that happen to be in top-K, falls back to "keep"
+  otherwise. UUIDs and free-form text land here; they are better
+  served by the bloom filter, but the synopsis still gates cleanly
+  for top-K hits.
+
+The earlier policy ("always cap at top_k_per_key, even if the key
+has only slightly more distinct values than top_k") caused
+near-universal "other-bucket pollution": with default `top_k=64`
+and a workload of, say, 100 distinct values, ~99% of heads ended
+up with `other_counts[key] > 0`, forcing the gate to return
+"unknown" for every query and silently degrading to a no-op.
+Auto-promotion eliminates that trap by giving low/medium-card
+keys the exact-tracking regime regardless of `top_k_per_key`.
+
+### `head_synopsis_max_cardinality`
+
+The threshold that selects the regime. Default 1024.
+
+- Keys with `distinct_values ≤ max_cardinality` are tracked exactly.
+- Keys with `distinct_values > max_cardinality` are compressed via
+  top-K + other.
 
 ### `head_synopsis_top_k_per_key`
 
-Per key, track only the top-K most frequent values (by global
-bitmap cardinality). Default 64.
+Default 64. Only consulted in the high-cardinality regime; ignored
+when the key fits within `max_cardinality`. For genuinely
+high-cardinality keys, this controls the size/precision tradeoff:
+top-K largest exact entries per head, rest collapsed into one
+`other_counts` integer per head.
 
-Values beyond the top K go into an "other" bucket per cluster,
-storing the *total* count of docs with any non-top-K value of that
-key. The gate is conservative for the "other" bucket — it treats it
-as count > 0 if any non-top-K value is plausible. In practice this
-means: if the predicate value is in the top-K, the gate is exact;
-otherwise, the gate falls back to "keep" (no information).
+### Gate logic for `key = v`
+
+```
+if counts[key].contains(v):
+    return drop iff counts[key][v] == 0
+elif other_counts[key] == 0 (or absent):
+    return drop  (provably zero — exact regime, or v isn't a known value)
+else:
+    return keep  (unknown — high-card mode and v not in top-K)
+```
+
+### Data structure
 
 ```rust
 pub struct HeadSynopsis {
     pub head_size: u64,
     pub counts: HashMap<String, HashMap<String, u64>>,
-    /// Per-key count of docs with a value outside the top-K. The
-    /// gate falls back to "keep" for predicates whose value is in
-    /// the "other" bucket.
+    /// Per-key count of docs with a value not in `counts[key]`. Always
+    /// 0 (or absent) under the exact-tracking regime; only positive
+    /// under the high-card top-K + other regime.
     pub other_counts: HashMap<String, u64>,
 }
 ```
 
-Gate logic for `key = v`:
-- If `v` is in `counts[key]`: drop iff `counts[key][v] == 0`.
-- If `v` is *not* in `counts[key]` (i.e. it's a non-top-K value):
-  drop iff `other_counts[key] == 0`. If `other_counts[key] > 0`, the
-  cluster *might* have a doc with value `v` (or might just have
-  other non-top-K values) — keep, can't tell.
-
-### `head_synopsis_max_cardinality`
-
-Skip keys entirely if their distinct-value count exceeds this
-threshold. Default 1024. For high-cardinality keys (like UUIDs), the
-synopsis adds little signal even with top-K capping, and storage is
-wasted. The bloom filter handles these well.
-
-A query's gate looks up `counts[key]`. If the entry is missing
-(because we skipped that key), the gate falls back to "keep" — no
-information.
-
 ### Memory budget
 
-With defaults: `1000 heads × 10 indexed keys × 64 values × ~30 bytes
-per entry ≈ 19 MB` per segment shard. Well within typical SPANN
-segment budgets.
+Worst-case per head, per key:
+- Exact regime: `O(distinct_values)` entries — bounded by
+  `max_cardinality` (default ≤1024).
+- Compressed regime: `O(top_k_per_key)` entries + 1 integer.
+
+Across a 1000-head, 10-keyed segment with default config and typical
+metadata cardinalities (≤100 values per key), storage runs ~5–20 MB
+per segment shard. Well within SPANN segment budgets.
 
 For a fixed-budget alternative, use Misra-Gries / Space-Saving
 streaming top-K instead of exact top-K (which requires sorting full

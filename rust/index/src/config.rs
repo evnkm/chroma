@@ -117,10 +117,19 @@ pub struct SpannProviderConfig {
     pub head_bloom_doc_tokens_cache: bool,
     #[serde(default = "default_head_bloom_commit_rebuild")]
     pub head_bloom_commit_rebuild: bool,
+    /// Master switch for the per-cluster metadata-value-counts gate.
     #[serde(default = "default_head_synopsis_enabled")]
     pub head_synopsis_enabled: bool,
+    /// Top-K most frequent values to track per key **only when the key
+    /// is in the high-cardinality regime** (distinct_values >
+    /// `head_synopsis_max_cardinality`). For keys with distinct_values
+    /// ≤ `head_synopsis_max_cardinality`, all values are tracked
+    /// exactly and this knob has no effect. Default 64.
     #[serde(default = "default_head_synopsis_top_k_per_key")]
     pub head_synopsis_top_k_per_key: u32,
+    /// Auto-promotion threshold: keys with `distinct_values ≤ this`
+    /// are tracked exactly (no `other_counts` pollution); keys above
+    /// this are compressed via top-K + other. Default 1024.
     #[serde(default = "default_head_synopsis_max_cardinality")]
     pub head_synopsis_max_cardinality: u32,
     #[cfg(feature = "usearch")]
