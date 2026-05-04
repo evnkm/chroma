@@ -1,0 +1,14 @@
+{
+  "dataset": "sift1m",
+  "n_records": 10000,
+  "n_queries": 50,
+  "buckets": 500,
+  "selectivity": 0.002,
+  "probe_nbr_seed": 32,
+  "index_metadata": {
+    "none": {"build_ms": 3387, "blob_storage_bytes": 0},
+    "bloom": {"build_ms": 3326, "blob_storage_bytes": 375544},
+    "synopsis": {"build_ms": 3509, "blob_storage_bytes": 789725},
+    "both": {"build_ms": 3580, "blob_storage_bytes": 1158709}
+  }
+}
