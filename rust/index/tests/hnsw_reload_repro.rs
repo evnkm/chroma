@@ -158,6 +158,7 @@ fn run_repro(seed: u64) {
                 SpannMetrics::default(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("writer should open");
@@ -208,6 +209,7 @@ fn run_repro(seed: u64) {
             prefix_path,
             true,
             params,
+            None,
             None,
         ))
         .await

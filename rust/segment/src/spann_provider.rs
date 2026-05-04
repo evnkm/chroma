@@ -29,6 +29,9 @@ pub struct SpannProvider {
     pub head_bloom_capacity_factor: u32,
     pub head_bloom_doc_tokens_cache: bool,
     pub head_bloom_commit_rebuild: bool,
+    pub head_synopsis_enabled: bool,
+    pub head_synopsis_top_k_per_key: u32,
+    pub head_synopsis_max_cardinality: u32,
     #[cfg(feature = "usearch")]
     pub usearch_provider: USearchIndexProvider,
 }
@@ -65,6 +68,9 @@ impl Configurable<(HnswIndexProvider, BlockfileProvider, SpannProviderConfig)> f
             head_bloom_capacity_factor: config.2.head_bloom_capacity_factor,
             head_bloom_doc_tokens_cache: config.2.head_bloom_doc_tokens_cache,
             head_bloom_commit_rebuild: config.2.head_bloom_commit_rebuild,
+            head_synopsis_enabled: config.2.head_synopsis_enabled,
+            head_synopsis_top_k_per_key: config.2.head_synopsis_top_k_per_key,
+            head_synopsis_max_cardinality: config.2.head_synopsis_max_cardinality,
         })
     }
 }
@@ -107,6 +113,9 @@ impl
             head_bloom_capacity_factor: config.2.head_bloom_capacity_factor,
             head_bloom_doc_tokens_cache: config.2.head_bloom_doc_tokens_cache,
             head_bloom_commit_rebuild: config.2.head_bloom_commit_rebuild,
+            head_synopsis_enabled: config.2.head_synopsis_enabled,
+            head_synopsis_top_k_per_key: config.2.head_synopsis_top_k_per_key,
+            head_synopsis_max_cardinality: config.2.head_synopsis_max_cardinality,
             usearch_provider: config.3.clone(),
         })
     }
@@ -134,6 +143,9 @@ impl SpannProvider {
             self.head_bloom_capacity_factor,
             self.head_bloom_doc_tokens_cache,
             self.head_bloom_commit_rebuild,
+            self.head_synopsis_enabled,
+            self.head_synopsis_top_k_per_key,
+            self.head_synopsis_max_cardinality,
         )
         .await
     }

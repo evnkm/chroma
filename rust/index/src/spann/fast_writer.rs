@@ -2210,6 +2210,7 @@ impl FastSpannIndexWriter {
                     .clone(),
             },
             head_bloom_blob: None,
+            head_synopsis_blob: None,
         })
     }
 }

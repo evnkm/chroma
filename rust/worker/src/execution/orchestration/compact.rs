@@ -2136,6 +2136,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
 
@@ -2338,6 +2341,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
 
@@ -2539,6 +2545,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
 
@@ -2814,6 +2823,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
         let system = System::new();
@@ -3049,6 +3061,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
         let system = System::new();
@@ -3383,6 +3398,9 @@ mod tests {
             head_bloom_capacity_factor: 4,
             head_bloom_doc_tokens_cache: false,
             head_bloom_commit_rebuild: false,
+            head_synopsis_enabled: false,
+            head_synopsis_top_k_per_key: 64,
+            head_synopsis_max_cardinality: 1024,
             usearch_provider,
         };
         let system = System::new();

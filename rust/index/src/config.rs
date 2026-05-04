@@ -75,6 +75,18 @@ fn default_head_bloom_commit_rebuild() -> bool {
     false
 }
 
+fn default_head_synopsis_enabled() -> bool {
+    false
+}
+
+fn default_head_synopsis_top_k_per_key() -> u32 {
+    64
+}
+
+fn default_head_synopsis_max_cardinality() -> u32 {
+    1024
+}
+
 #[derive(Deserialize, Debug, Clone, Serialize)]
 pub enum PlGarbageCollectionPolicyConfig {
     #[serde(rename = "random_sample")]
@@ -105,6 +117,12 @@ pub struct SpannProviderConfig {
     pub head_bloom_doc_tokens_cache: bool,
     #[serde(default = "default_head_bloom_commit_rebuild")]
     pub head_bloom_commit_rebuild: bool,
+    #[serde(default = "default_head_synopsis_enabled")]
+    pub head_synopsis_enabled: bool,
+    #[serde(default = "default_head_synopsis_top_k_per_key")]
+    pub head_synopsis_top_k_per_key: u32,
+    #[serde(default = "default_head_synopsis_max_cardinality")]
+    pub head_synopsis_max_cardinality: u32,
     #[cfg(feature = "usearch")]
     #[serde(default)]
     pub usearch_provider: USearchProviderConfig,

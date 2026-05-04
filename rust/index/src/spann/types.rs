@@ -39,6 +39,11 @@ use crate::{
         self, EqualityTokens, HeadBloom, HeadBloomBlob, HeadBloomBlobFlusher, HeadBloomCache,
         HeadBloomReadConfig, HeadBloomWriteConfig,
     },
+    spann::head_synopsis::{
+        self, apply_top_k_capping, HeadRawCounts, HeadSynopsis, HeadSynopsisBlob,
+        HeadSynopsisBlobFlusher, HeadSynopsisCache, HeadSynopsisReadConfig,
+        HeadSynopsisWriteConfig, SynopsisPredicate, SynopsisToken,
+    },
     spann::utils::cluster,
     IndexUuid,
 };
@@ -337,6 +342,14 @@ pub struct SpannIndexWriter {
     pub head_bloom_cache: HeadBloomCache,
     pub head_bloom_doc_tokens_cache_enabled: bool,
     pub head_bloom_commit_rebuild_enabled: bool,
+    pub head_synopsis_enabled: bool,
+    pub head_synopsis_top_k_per_key: u32,
+    pub head_synopsis_max_cardinality: u32,
+    /// Per-doc structured tokens, populated on add/update, cleared on
+    /// delete. Only allocated when synopsis is enabled. The synopsis is
+    /// rebuilt at commit by joining this cache against the committed
+    /// posting lists.
+    pub head_synopsis_doc_tokens: Option<Arc<dashmap::DashMap<u32, Arc<Vec<SynopsisToken>>>>>,
 }
 
 #[derive(Error, Debug)]
@@ -401,6 +414,8 @@ pub enum SpannIndexWriterError {
     KMeansClusteringError(#[from] KMeansError),
     #[error("Error saving head bloom filter blob: {0}")]
     HeadBloomBlobSaveError(String),
+    #[error("Error saving head synopsis blob: {0}")]
+    HeadSynopsisBlobSaveError(String),
 }
 
 impl ChromaError for SpannIndexWriterError {
@@ -436,6 +451,7 @@ impl ChromaError for SpannIndexWriterError {
             Self::MaxHeadIdWriterCreateError(e) => e.code(),
             Self::KMeansClusteringError(e) => e.code(),
             Self::HeadBloomBlobSaveError(_) => ErrorCodes::Internal,
+            Self::HeadSynopsisBlobSaveError(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -469,6 +485,12 @@ impl SpannIndexWriter {
         head_bloom_cache: HeadBloomCache,
         head_bloom_doc_tokens_cache_enabled: bool,
         head_bloom_commit_rebuild_enabled: bool,
+        head_synopsis_enabled: bool,
+        head_synopsis_top_k_per_key: u32,
+        head_synopsis_max_cardinality: u32,
+        head_synopsis_doc_tokens: Option<
+            Arc<dashmap::DashMap<u32, Arc<Vec<SynopsisToken>>>>,
+        >,
     ) -> Self {
         SpannIndexWriter {
             hnsw_index,
@@ -491,6 +513,10 @@ impl SpannIndexWriter {
             head_bloom_cache,
             head_bloom_doc_tokens_cache_enabled,
             head_bloom_commit_rebuild_enabled,
+            head_synopsis_enabled,
+            head_synopsis_top_k_per_key,
+            head_synopsis_max_cardinality,
+            head_synopsis_doc_tokens,
         }
     }
 
@@ -665,6 +691,7 @@ impl SpannIndexWriter {
         metrics: SpannMetrics,
         cmek: Option<Cmek>,
         head_bloom_config: Option<HeadBloomWriteConfig<'_>>,
+        head_synopsis_config: Option<HeadSynopsisWriteConfig<'_>>,
     ) -> Result<Self, SpannIndexWriterError> {
         let distance_function = DistanceFunction::from(params.space.clone());
         // Create the HNSW index.
@@ -786,6 +813,25 @@ impl SpannIndexWriter {
             None => (false, HeadBloomCache::new(0), false, false),
         };
 
+        let (
+            head_synopsis_enabled,
+            head_synopsis_top_k_per_key,
+            head_synopsis_max_cardinality,
+            head_synopsis_doc_tokens,
+        ) = match head_synopsis_config {
+            Some(cfg) => {
+                let doc_tokens: Arc<dashmap::DashMap<u32, Arc<Vec<SynopsisToken>>>> =
+                    Arc::new(dashmap::DashMap::new());
+                (
+                    true,
+                    cfg.top_k_per_key.max(1),
+                    cfg.max_cardinality.max(1),
+                    Some(doc_tokens),
+                )
+            }
+            None => (false, 1, 1, None),
+        };
+
         Ok(Self::new(
             hnsw_index,
             hnsw_provider.clone(),
@@ -804,6 +850,10 @@ impl SpannIndexWriter {
             head_bloom_cache,
             head_bloom_doc_tokens_cache_enabled,
             head_bloom_commit_rebuild_enabled,
+            head_synopsis_enabled,
+            head_synopsis_top_k_per_key,
+            head_synopsis_max_cardinality,
+            head_synopsis_doc_tokens,
         ))
     }
 
@@ -1735,6 +1785,17 @@ impl SpannIndexWriter {
         embedding: &[f32],
         metadata_tokens: &[String],
     ) -> Result<(), SpannIndexWriterError> {
+        self.add_with_metadata_tokens_and_synopsis(id, embedding, metadata_tokens, &[])
+            .await
+    }
+
+    pub async fn add_with_metadata_tokens_and_synopsis(
+        &self,
+        id: u32,
+        embedding: &[f32],
+        metadata_tokens: &[String],
+        synopsis_tokens: &[SynopsisToken],
+    ) -> Result<(), SpannIndexWriterError> {
         let version = self.add_versions_map(id).await;
         // Normalize the embedding in case of cosine.
         let mut normalized_embedding = embedding.to_vec();
@@ -1744,6 +1805,11 @@ impl SpannIndexWriter {
         }
         if self.head_bloom_enabled {
             self.head_bloom_cache.seed_doc_tokens(id, metadata_tokens);
+        }
+        if self.head_synopsis_enabled {
+            if let Some(map) = &self.head_synopsis_doc_tokens {
+                map.insert(id, Arc::new(synopsis_tokens.to_vec()));
+            }
         }
         let token_arg = if self.head_bloom_enabled {
             Some(metadata_tokens)
@@ -1763,6 +1829,17 @@ impl SpannIndexWriter {
         id: u32,
         embedding: &[f32],
         metadata_tokens: &[String],
+    ) -> Result<(), SpannIndexWriterError> {
+        self.update_with_metadata_tokens_and_synopsis(id, embedding, metadata_tokens, &[])
+            .await
+    }
+
+    pub async fn update_with_metadata_tokens_and_synopsis(
+        &self,
+        id: u32,
+        embedding: &[f32],
+        metadata_tokens: &[String],
+        synopsis_tokens: &[SynopsisToken],
     ) -> Result<(), SpannIndexWriterError> {
         let inc_version;
         {
@@ -1791,6 +1868,11 @@ impl SpannIndexWriter {
         if self.head_bloom_enabled {
             self.head_bloom_cache.seed_doc_tokens(id, metadata_tokens);
         }
+        if self.head_synopsis_enabled {
+            if let Some(map) = &self.head_synopsis_doc_tokens {
+                map.insert(id, Arc::new(synopsis_tokens.to_vec()));
+            }
+        }
         let token_arg = if self.head_bloom_enabled {
             Some(metadata_tokens)
         } else {
@@ -1807,6 +1889,11 @@ impl SpannIndexWriter {
         }
         if self.head_bloom_enabled {
             self.head_bloom_cache.forget_doc(id);
+        }
+        if self.head_synopsis_enabled {
+            if let Some(map) = &self.head_synopsis_doc_tokens {
+                map.remove(&id);
+            }
         }
         Ok(())
     }
@@ -2570,11 +2657,102 @@ impl SpannIndexWriter {
         Ok(())
     }
 
+    /// Build the per-head synopsis map by joining live posting lists against
+    /// the cached per-doc structured tokens. A head is omitted entirely if
+    /// any of its live docs has no cached tokens (e.g. loaded from a prior
+    /// segment without a synopsis). Missing entries → gate falls back to
+    /// "keep", so omitting a head is correctness-safe.
+    async fn build_head_synopsis_map(
+        &self,
+    ) -> Result<HashMap<u32, HeadSynopsis>, SpannIndexWriterError> {
+        let Some(doc_tokens_map) = self.head_synopsis_doc_tokens.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        // Live head ids: anything still indexed in HNSW.
+        let (non_deleted, _deleted) = {
+            let read_guard = self.hnsw_index.inner.read();
+            read_guard.hnsw_index.get_all_ids().map_err(|e| {
+                tracing::error!(
+                    "Error getting all ids from hnsw during synopsis build: {}",
+                    e
+                );
+                SpannIndexWriterError::HnswIndexSearchError(e)
+            })?
+        };
+        let mut raw: HashMap<u32, HeadRawCounts> = HashMap::new();
+        for head_id in non_deleted {
+            let head_id = head_id as u32;
+            let pl = match self
+                .posting_list_writer
+                .get_owned::<u32, &SpannPostingList<'_>>("", head_id)
+                .await
+            {
+                Ok(Some(pl)) => pl,
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(SpannIndexWriterError::PostingListGetError(e));
+                }
+            };
+            let (doc_offset_ids, doc_versions, _) = pl;
+            let mut head_size: u64 = 0;
+            let mut counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
+            let mut any_miss = false;
+            {
+                let version_map_guard = self.versions_map.read().await;
+                for (doc_id, doc_version) in
+                    doc_offset_ids.iter().zip(doc_versions.iter())
+                {
+                    let current = match version_map_guard.versions_map.get(doc_id) {
+                        Some(v) => *v,
+                        None => continue,
+                    };
+                    if current == 0 || *doc_version < current {
+                        continue;
+                    }
+                    head_size += 1;
+                    let Some(toks) = doc_tokens_map.get(doc_id).map(|r| r.clone()) else {
+                        any_miss = true;
+                        break;
+                    };
+                    for (k, v) in toks.iter() {
+                        *counts
+                            .entry(k.clone())
+                            .or_default()
+                            .entry(v.clone())
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+            if any_miss {
+                // Stale head: any matching doc among the unknowns could be
+                // present. Skip the synopsis entry; gate falls back to keep.
+                continue;
+            }
+            raw.insert(
+                head_id,
+                HeadRawCounts {
+                    head_size,
+                    counts,
+                },
+            );
+        }
+        Ok(apply_top_k_capping(
+            raw,
+            self.head_synopsis_top_k_per_key,
+            self.head_synopsis_max_cardinality,
+        ))
+    }
+
     pub async fn commit(self) -> Result<SpannIndexFlusher, SpannIndexWriterError> {
         self.emit_counters();
         if self.head_bloom_enabled && self.head_bloom_commit_rebuild_enabled {
             self.rebuild_blooms_from_cache().await?;
         }
+        let head_synopsis_map = if self.head_synopsis_enabled {
+            self.build_head_synopsis_map().await?
+        } else {
+            HashMap::new()
+        };
         // NOTE(Sanket): This is not the best way to drain the writer but the orchestrator keeps a
         // reference to the writer so cannot do an Arc::try_unwrap() here.
         // Pl list.
@@ -2741,6 +2919,34 @@ impl SpannIndexWriter {
             None
         };
 
+        let head_synopsis_blob = if self.head_synopsis_enabled && !head_synopsis_map.is_empty() {
+            let blob = HeadSynopsisBlob {
+                synopses: head_synopsis_map,
+            };
+            match bincode::serialize(&blob) {
+                Ok(bytes) => {
+                    let blob_id = Uuid::new_v4();
+                    let path = if self.prefix_path.is_empty() {
+                        blob_id.to_string()
+                    } else {
+                        format!("{}/{}", self.prefix_path, blob_id)
+                    };
+                    Some(HeadSynopsisBlobFlusher {
+                        bytes,
+                        path,
+                        blob_id,
+                        storage: self.blockfile_provider.storage(),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize head synopsis blob: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(SpannIndexFlusher {
             pl_flusher,
             versions_map_flusher,
@@ -2763,6 +2969,7 @@ impl SpannIndexWriter {
                     .clone(),
             },
             head_bloom_blob,
+            head_synopsis_blob,
         })
     }
 }
@@ -2782,6 +2989,7 @@ pub struct SpannIndexFlusher {
     pub(crate) hnsw_flusher: HnswIndexFlusher,
     pub(crate) metrics: SpannIndexFlusherMetrics,
     pub(crate) head_bloom_blob: Option<HeadBloomBlobFlusher>,
+    pub(crate) head_synopsis_blob: Option<HeadSynopsisBlobFlusher>,
 }
 
 #[derive(Debug)]
@@ -2792,11 +3000,13 @@ pub struct SpannIndexIds {
     pub hnsw_id: IndexUuid,
     pub prefix_path: String,
     pub head_bloom_blob_path: Option<String>,
+    pub head_synopsis_blob_path: Option<String>,
 }
 
 impl SpannIndexFlusher {
     pub async fn flush(self) -> Result<SpannIndexIds, SpannIndexWriterError> {
         let head_bloom_blob_path = self.head_bloom_blob.as_ref().map(|b| b.path.clone());
+        let head_synopsis_blob_path = self.head_synopsis_blob.as_ref().map(|b| b.path.clone());
         let mut res = SpannIndexIds {
             pl_id: self.pl_flusher.id(),
             versions_map_id: self.versions_map_flusher.id(),
@@ -2804,6 +3014,7 @@ impl SpannIndexFlusher {
             hnsw_id: self.hnsw_flusher.index_id,
             prefix_path: self.max_head_id_flusher.prefix_path().to_string(),
             head_bloom_blob_path: None,
+            head_synopsis_blob_path: None,
         };
 
         {
@@ -2890,6 +3101,13 @@ impl SpannIndexFlusher {
                 SpannIndexWriterError::HeadBloomBlobSaveError(e.to_string())
             })?;
             res.head_bloom_blob_path = head_bloom_blob_path;
+        }
+        if let Some(blob) = self.head_synopsis_blob {
+            blob.save().await.map_err(|e| {
+                tracing::error!("Error saving head synopsis blob: {}", e);
+                SpannIndexWriterError::HeadSynopsisBlobSaveError(e.to_string())
+            })?;
+            res.head_synopsis_blob_path = head_synopsis_blob_path;
         }
         Ok(res)
     }
@@ -2979,6 +3197,7 @@ pub struct SpannIndexReader<'me> {
     pub adaptive_search_nprobe: bool,
     pub params: InternalSpannConfiguration,
     pub head_bloom_filters: Option<Arc<HeadBloomCache>>,
+    pub head_synopsis_filters: Option<Arc<HeadSynopsisCache>>,
 }
 
 impl<'me> SpannIndexReader<'me> {
@@ -3062,6 +3281,7 @@ impl<'me> SpannIndexReader<'me> {
         adaptive_search_nprobe: bool,
         params: InternalSpannConfiguration,
         head_bloom_config: Option<HeadBloomReadConfig<'_>>,
+        head_synopsis_config: Option<HeadSynopsisReadConfig<'_>>,
     ) -> Result<SpannIndexReader<'me>, SpannIndexReaderError> {
         let hnsw_reader = match hnsw_id {
             Some(hnsw_id) => {
@@ -3121,6 +3341,27 @@ impl<'me> SpannIndexReader<'me> {
             None
         };
 
+        let head_synopsis_filters = if let Some(cfg) = head_synopsis_config {
+            if let (Some(blob_path), Some(storage)) = (cfg.blob_path, blockfile_provider.storage())
+            {
+                match Self::load_head_synopsis_cache(&storage, blob_path).await {
+                    Ok(cache) => Some(Arc::new(cache)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load head synopsis blob at {}: {}; degrading gate to no-op",
+                            blob_path,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             posting_lists: postings_list_reader,
             hnsw_index: hnsw_reader,
@@ -3129,7 +3370,25 @@ impl<'me> SpannIndexReader<'me> {
             adaptive_search_nprobe,
             params,
             head_bloom_filters,
+            head_synopsis_filters,
         })
+    }
+
+    async fn load_head_synopsis_cache(
+        storage: &Storage,
+        path: &str,
+    ) -> Result<HeadSynopsisCache, String> {
+        let bytes = storage
+            .get(path, GetOptions::new(StorageRequestPriority::P0))
+            .await
+            .map_err(|e| e.to_string())?;
+        let blob: HeadSynopsisBlob =
+            bincode::deserialize(&bytes[..]).map_err(|e| e.to_string())?;
+        let cache = HeadSynopsisCache::new();
+        for (head_id, synopsis) in blob.synopses {
+            cache.insert(head_id, synopsis);
+        }
+        Ok(cache)
     }
 
     async fn load_head_bloom_filters(
@@ -3166,6 +3425,29 @@ impl<'me> SpannIndexReader<'me> {
         let kept = head_bloom::gate_heads(
             candidate_head_ids.iter().map(|h| *h as u32),
             tokens,
+            |hid| cache.get(hid),
+        );
+        kept.into_iter().map(|h| h as usize).collect()
+    }
+
+    /// Drop heads whose synopsis provably has zero matches for the
+    /// predicate. Pass-through if no synopsis is loaded or the predicate
+    /// isn't gateable. The synopsis is exact, so no false-negative drops
+    /// can occur (any drop is correctness-safe).
+    pub fn gate_heads_synopsis(
+        &self,
+        candidate_head_ids: &[usize],
+        predicate: &SynopsisPredicate,
+    ) -> Vec<usize> {
+        let Some(cache) = &self.head_synopsis_filters else {
+            return candidate_head_ids.to_vec();
+        };
+        if !predicate.is_gateable() {
+            return candidate_head_ids.to_vec();
+        }
+        let kept = head_synopsis::gate_heads(
+            candidate_head_ids.iter().map(|h| *h as u32),
+            predicate,
             |hid| cache.get(hid),
         );
         kept.into_iter().map(|h| h as usize).collect()
@@ -3502,6 +3784,7 @@ mod tests {
             SpannMetrics::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("Error creating spann index writer");
@@ -3718,6 +4001,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
             None,
         )
@@ -3982,6 +4266,7 @@ mod tests {
             SpannMetrics::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("Error creating spann index writer");
@@ -4207,6 +4492,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
             None,
         )
@@ -4476,6 +4762,7 @@ mod tests {
             gc_context,
             pl_block_size,
             SpannMetrics::default(),
+            None,
             None,
             None,
         )
@@ -4789,6 +5076,7 @@ mod tests {
                 SpannMetrics::default(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -4830,6 +5118,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
                 None,
             ))
             .await
@@ -4908,6 +5197,7 @@ mod tests {
                 SpannMetrics::default(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -4971,6 +5261,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
                 None,
             ))
             .await
@@ -5051,6 +5342,7 @@ mod tests {
                     SpannMetrics::default(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("Error creating spann index writer");
@@ -5100,6 +5392,7 @@ mod tests {
                 prefix_path,
                 true,
                 params.clone(),
+                None,
                 None,
             ))
             .await
@@ -5197,6 +5490,7 @@ mod tests {
                     SpannMetrics::default(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("Error creating spann index writer");
@@ -5256,6 +5550,7 @@ mod tests {
                 prefix_path,
                 true,
                 params.clone(),
+                None,
                 None,
             ))
             .await
@@ -5362,6 +5657,7 @@ mod tests {
                     gc_context.clone(),
                     pl_block_size,
                     SpannMetrics::default(),
+                    None,
                     None,
                     None,
                 )
@@ -5482,6 +5778,7 @@ mod tests {
                 SpannMetrics::default(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -5559,6 +5856,7 @@ mod tests {
                 true,
                 params.clone(),
                 None,
+                None,
             ))
             .await
             .expect("Error creating spann index reader");
@@ -5608,6 +5906,7 @@ mod tests {
                 SpannMetrics::default(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("Error creating spann index writer");
@@ -5637,6 +5936,7 @@ mod tests {
                 prefix_path,
                 true,
                 params,
+                None,
                 None,
             ))
             .await

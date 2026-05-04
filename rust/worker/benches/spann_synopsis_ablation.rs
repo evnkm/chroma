@@ -1,33 +1,34 @@
-// BloomHeads ablation: iso-probe (correctness check) + iso-I/O (value claim).
+// HeadSynopsis ablation: iso-probe (correctness check) + iso-I/O (value claim).
 //
-// Builds two SPANN indexes on a SIFT1M subset — one with bloom disabled (000)
-// and one with bloom enabled + Phase 1.5 Option 2 (010). For each query (and
-// the same metadata predicate `bucket = 0` at ~1% selectivity), measures:
+// Builds two SPANN indexes on a SIFT1M subset — one with synopsis disabled
+// (000) and one with synopsis enabled (001). For each query (and the same
+// metadata predicate `bucket = 0` at ~1% selectivity), measures:
 //
 //   iso-probe: same probe_nbr, both indexes
-//     - recall@k must be preserved within bench noise
+//     - recall@k must be preserved within bench noise (synopsis is exact
+//       so Δrecall must be ≈ 0, modulo SPANN-internal nondeterminism)
 //     - drop_ratio (heads dropped by gate / heads from rng_query) must be > 0
-//     - [gate-audit] must report 0 heads dropped that contained matching docs
+//     - [gate-audit] must report 0 heads dropped that contained matching
+//       docs (the synopsis is exact, so any positive count is a serious bug)
 //
-//   iso-I/O: 000 fetches `B` PLs; 010 probes more centroids and the gate
+//   iso-I/O: 000 fetches `B` PLs; 001 probes more centroids and the gate
 //     trims down to ~B fetches. Recall@k is compared at matched I/O.
-//     The headline measurement: iso-I/O Δrecall ≥ 0 means the gate is worth
-//     its complexity.
+//     The headline measurement: iso-I/O Δrecall ≥ 0 means the gate is
+//     worth its complexity.
 //
 // Output: a CSV under LOGS_PLANS/benchmarks/ with one row per
-//   (q_idx, scenario [iso_probe|iso_io], strategy [000|010]).
+//   (q_idx, scenario [iso_probe|iso_io], strategy [000|001]).
 //
 // Env knobs:
 //   BENCH_N_RECORDS (default 10000)
 //   BENCH_N_QUERIES (default 50)
 //   BENCH_K (default 10)
 //   BENCH_BUCKETS (default 100, => 1% selectivity)
-//   BENCH_PROBE_NBR (default 32) — iso-probe baseline; iso-I/O 000 also uses
-//     this and 010 is sized so heads_after_bloom ≈ this number.
-//   BENCH_PROBE_NBR_010_ISO_IO (default 0 = auto from drop_ratio with margin)
-//   BLOOM_AUDIT_NO_PANIC (default unset = panic on false negative)
-//   BLOOM_DOC_TOKENS_CACHE (default unset = off)
-//   BLOOM_COMMIT_REBUILD (default unset = off)
+//   BENCH_PROBE_NBR (default 32)
+//   BENCH_PROBE_NBR_001_ISO_IO (default 0 = auto from drop_ratio with margin)
+//   SYNOPSIS_TOP_K (default 64)
+//   SYNOPSIS_MAX_CARD (default 1024)
+//   SYNOPSIS_AUDIT_NO_PANIC (default unset = panic on false negative)
 
 use std::{
     collections::HashSet,
@@ -50,14 +51,18 @@ use chroma_index::{
     config::{HnswGarbageCollectionConfig, PlGarbageCollectionConfig},
     hnsw_provider::HnswIndexProvider,
     spann::{
-        head_bloom::{EqualityTokens, HeadBloomReadConfig, HeadBloomWriteConfig},
+        head_synopsis::{
+            HeadSynopsisReadConfig, HeadSynopsisWriteConfig, SynopsisPredicate, SynopsisToken,
+        },
         types::{GarbageCollectionContext, SpannIndexReader, SpannIndexWriter, SpannMetrics},
         utils::rng_query,
     },
 };
 use chroma_storage::{local::LocalStorage, Storage};
 use chroma_system::Operator;
-use chroma_types::{operator::Merge, CollectionUuid, InternalSpannConfiguration, SignedRoaringBitmap};
+use chroma_types::{
+    operator::Merge, CollectionUuid, InternalSpannConfiguration, SignedRoaringBitmap,
+};
 use roaring::RoaringBitmap;
 use worker::execution::operators::{
     knn_merge::KnnMergeInput,
@@ -65,7 +70,10 @@ use worker::execution::operators::{
 };
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|s| s.parse::<T>().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<T>().ok())
+        .unwrap_or(default)
 }
 
 fn env_string(key: &str, default: &str) -> String {
@@ -92,7 +100,7 @@ struct BuiltIndex<'a> {
     blockfile_provider: BlockfileProvider,
     hnsw_provider: HnswIndexProvider,
     paths: chroma_index::spann::types::SpannIndexIds,
-    bloom_path: Option<String>,
+    synopsis_path: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -103,9 +111,9 @@ async fn build_index(
     n_buckets: u32,
     dim: usize,
     params: InternalSpannConfiguration,
-    bloom_enabled: bool,
-    doc_tokens_cache: bool,
-    commit_rebuild: bool,
+    synopsis_enabled: bool,
+    top_k_per_key: u32,
+    max_cardinality: u32,
 ) -> BuiltIndex<'static> {
     let block_cache = new_cache_for_test();
     let sparse_index_cache = new_cache_for_test();
@@ -132,13 +140,11 @@ async fn build_index(
     .expect("gc context");
     let prefix_path = "";
 
-    let head_bloom_config = if bloom_enabled {
-        let capacity = (params.split_threshold as u64).saturating_mul(4).max(1);
-        Some(HeadBloomWriteConfig {
-            capacity_per_head: capacity,
+    let head_synopsis_config = if synopsis_enabled {
+        Some(HeadSynopsisWriteConfig {
+            top_k_per_key,
+            max_cardinality,
             existing_blob_path: None,
-            doc_tokens_cache_enabled: doc_tokens_cache,
-            commit_rebuild_enabled: commit_rebuild,
         })
     } else {
         None
@@ -159,25 +165,32 @@ async fn build_index(
         5 * 1024 * 1024,
         SpannMetrics::default(),
         None,
-        head_bloom_config,
         None,
+        head_synopsis_config,
     )
     .await
     .expect("spann writer");
 
     eprintln!(
-        "[setup] building SPANN index (bloom={}, n={}, buckets={})",
-        bloom_enabled, records.len(), n_buckets
+        "[setup] building SPANN index (synopsis={}, n={}, buckets={})",
+        synopsis_enabled,
+        records.len(),
+        n_buckets
     );
     let t = Instant::now();
     for (i, (id, record)) in records.iter().enumerate() {
-        let tokens = if bloom_enabled {
-            vec![format!("meta::bucket::int::{}", record_buckets[i])]
+        let synopsis_tokens: Vec<SynopsisToken> = if synopsis_enabled {
+            vec![("bucket".to_string(), format!("int::{}", record_buckets[i]))]
         } else {
             Vec::new()
         };
         writer
-            .add_with_metadata_tokens(*id, record.as_slice(), &tokens)
+            .add_with_metadata_tokens_and_synopsis(
+                *id,
+                record.as_slice(),
+                &[],
+                &synopsis_tokens,
+            )
             .await
             .expect("add record");
     }
@@ -185,13 +198,18 @@ async fn build_index(
 
     let flusher = Box::pin(writer.commit()).await.expect("commit");
     let paths = Box::pin(flusher.flush()).await.expect("flush");
-    eprintln!("[setup] commit+flush done in {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "[setup] commit+flush done in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
-    let bloom_path = paths.head_bloom_blob_path.clone();
+    let synopsis_path = paths.head_synopsis_blob_path.clone();
 
-    let head_bloom_read = bloom_path.as_ref().map(|p| HeadBloomReadConfig {
-        blob_path: Some(p.as_str()),
-    });
+    let head_synopsis_read = synopsis_path
+        .as_ref()
+        .map(|p| HeadSynopsisReadConfig {
+            blob_path: Some(p.as_str()),
+        });
 
     let reader = Box::pin(SpannIndexReader::from_id(
         Some(&paths.hnsw_id),
@@ -206,24 +224,24 @@ async fn build_index(
         prefix_path,
         false, // disable size-based adaptive_search_nprobe; bench drives nprobe directly
         params,
-        head_bloom_read,
         None,
+        head_synopsis_read,
     ))
     .await
     .expect("spann reader");
 
     BuiltIndex {
         // SAFETY: The reader borrows from blockfile_provider and hnsw_provider.
-        // We move all three into BuiltIndex below; the lifetime erasure here is
-        // safe because BuiltIndex owns all backing storage for the reader's
-        // lifetime within this single-threaded bench.
+        // We move all three into BuiltIndex below; the lifetime erasure here
+        // is safe because BuiltIndex owns all backing storage for the
+        // reader's lifetime within this single-threaded bench.
         reader: unsafe {
             std::mem::transmute::<SpannIndexReader<'_>, SpannIndexReader<'static>>(reader)
         },
         blockfile_provider,
         hnsw_provider,
         paths,
-        bloom_path,
+        synopsis_path,
     }
 }
 
@@ -239,9 +257,7 @@ async fn ground_truth(
         .filter(|(id, _)| allowed.contains(id))
         .map(|(id, e)| (*id, distance_function.distance(e, query)))
         .collect();
-    gt.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    gt.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     gt.into_iter().take(k).map(|(id, _)| id).collect()
 }
 
@@ -264,7 +280,7 @@ async fn run_query(
     rng_epsilon: f32,
     rng_factor: f32,
     distance_function: &DistanceFunction,
-    bloom_tokens: &EqualityTokens,
+    predicate: &SynopsisPredicate,
     allowed_signed: &SignedRoaringBitmap,
     allowed_set: &HashSet<u32>,
     gt: &[u32],
@@ -284,7 +300,7 @@ async fn run_query(
     .await
     .expect("rng query");
     let heads_rng = head_ids.len();
-    let kept = reader.gate_heads(&head_ids, bloom_tokens);
+    let kept = reader.gate_heads_synopsis(&head_ids, predicate);
     let heads_fetched = kept.len();
     let kept_set: HashSet<usize> = kept.iter().copied().collect();
 
@@ -324,7 +340,9 @@ async fn run_query(
         merge_list.push(out.records);
     }
     let merged = Merge { k: k as u32 }
-        .run(&KnnMergeInput { batch_measures: merge_list })
+        .run(&KnnMergeInput {
+            batch_measures: merge_list,
+        })
         .await
         .expect("merge");
 
@@ -345,14 +363,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let k: usize = env_parse("BENCH_K", 10usize);
     let n_buckets: u32 = env_parse("BENCH_BUCKETS", 100u32);
     let probe_nbr: usize = env_parse("BENCH_PROBE_NBR", 32usize);
-    let probe_nbr_010_iso_io_override: usize = env_parse("BENCH_PROBE_NBR_010_ISO_IO", 0usize);
-    let doc_tokens_cache = env_flag("BLOOM_DOC_TOKENS_CACHE");
-    let commit_rebuild = env_flag("BLOOM_COMMIT_REBUILD");
-    let panic_on_bad_drop = !env_flag("BLOOM_AUDIT_NO_PANIC");
+    let probe_nbr_001_iso_io_override: usize = env_parse("BENCH_PROBE_NBR_001_ISO_IO", 0usize);
+    let top_k_per_key: u32 = env_parse("SYNOPSIS_TOP_K", 64u32);
+    let max_cardinality: u32 = env_parse("SYNOPSIS_MAX_CARD", 1024u32);
+    let panic_on_bad_drop = !env_flag("SYNOPSIS_AUDIT_NO_PANIC");
 
     let dataset_label = "sift1m";
     let default_out = format!(
-        "LOGS_PLANS/benchmarks/{}-bloom-ablation-n{}-q{}-buckets{}.csv",
+        "LOGS_PLANS/benchmarks/{}-synopsis-ablation-n{}-q{}-buckets{}.csv",
         dataset_label, n_records, n_queries, n_buckets
     );
     let output = env_string("BENCH_OUTPUT", &default_out);
@@ -365,8 +383,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dataset_label, n_records, n_queries, k, n_buckets, probe_nbr
     );
     eprintln!(
-        "[bench] doc_tokens_cache={} commit_rebuild={} probe_nbr_010_iso_io_override={}",
-        doc_tokens_cache, commit_rebuild, probe_nbr_010_iso_io_override
+        "[bench] top_k_per_key={} max_cardinality={} probe_nbr_001_iso_io_override={}",
+        top_k_per_key, max_cardinality, probe_nbr_001_iso_io_override
     );
     eprintln!("[bench] output={}", output);
 
@@ -395,11 +413,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Deterministic per-record bucket. bucket=0 docs are the ones the
     // predicate `bucket=0` matches, ~1/n_buckets selectivity.
-    let record_buckets: Vec<u32> = (0..records.len())
-        .map(|i| (i as u32) % n_buckets)
-        .collect();
+    let record_buckets: Vec<u32> = (0..records.len()).map(|i| (i as u32) % n_buckets).collect();
 
-    // Allowed bitmap (the predicate `bucket=0`).
     let mut allowed = RoaringBitmap::new();
     for (i, (id, _)) in records.iter().enumerate() {
         if record_buckets[i] == 0 {
@@ -408,13 +423,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let allowed_set: HashSet<u32> = allowed.iter().collect();
     let allowed_signed = SignedRoaringBitmap::Include(allowed);
-    eprintln!("[bench] allowed (predicate bucket=0): {} records", allowed_set.len());
+    eprintln!(
+        "[bench] allowed (predicate bucket=0): {} records",
+        allowed_set.len()
+    );
 
-    // Two storage temp dirs: one per index.
     let tmp_000 = tempfile::tempdir()?;
-    let tmp_010 = tempfile::tempdir()?;
+    let tmp_001 = tempfile::tempdir()?;
     let storage_000 = Storage::Local(LocalStorage::new(tmp_000.path().to_str().unwrap()));
-    let storage_010 = Storage::Local(LocalStorage::new(tmp_010.path().to_str().unwrap()));
+    let storage_001 = Storage::Local(LocalStorage::new(tmp_001.path().to_str().unwrap()));
 
     let params = InternalSpannConfiguration::default();
     let distance_function: DistanceFunction = params.clone().space.into();
@@ -429,40 +446,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dim,
         params.clone(),
         false,
-        false,
-        false,
+        top_k_per_key,
+        max_cardinality,
     )
     .await;
 
-    let idx_010 = build_index(
-        storage_010,
+    let idx_001 = build_index(
+        storage_001,
         &records,
         &record_buckets,
         n_buckets,
         dim,
         params.clone(),
         true,
-        doc_tokens_cache,
-        commit_rebuild,
+        top_k_per_key,
+        max_cardinality,
     )
     .await;
     eprintln!(
-        "[setup] 010 bloom blob path: {:?} (None means cache empty or storage missing)",
-        idx_010.bloom_path
+        "[setup] 001 synopsis blob path: {:?} (None means cache empty or storage missing)",
+        idx_001.synopsis_path
     );
     eprintln!(
-        "[setup] 010 reader has loaded filters: {}",
-        idx_010.reader.head_bloom_filters.is_some()
+        "[setup] 001 reader has loaded synopsis: {}",
+        idx_001.reader.head_synopsis_filters.is_some()
     );
-    if let Some(cache) = idx_010.reader.head_bloom_filters.as_ref() {
+    if let Some(cache) = idx_001.reader.head_synopsis_filters.as_ref() {
         eprintln!(
-            "[setup] 010 reader filter cache: len={} (non-stale heads with persisted bloom)",
+            "[setup] 001 reader synopsis cache: len={} (heads with persisted synopsis)",
             cache.len()
         );
     }
 
-    let tokens_000 = EqualityTokens::Unsupported;
-    let tokens_010 = EqualityTokens::And(vec!["meta::bucket::int::0".to_string()]);
+    let pred_off = SynopsisPredicate::Unsupported;
+    let pred_on = SynopsisPredicate::And(vec![("bucket".to_string(), "int::0".to_string())]);
 
     let mut out = BufWriter::new(File::create(&output)?);
     writeln!(
@@ -473,26 +490,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let selectivity = 1.0 / n_buckets as f64;
 
     let mut iso_probe_000 = ScenarioStats::default();
-    let mut iso_probe_010 = ScenarioStats::default();
+    let mut iso_probe_001 = ScenarioStats::default();
     let mut iso_io_000 = ScenarioStats::default();
-    let mut iso_io_010 = ScenarioStats::default();
+    let mut iso_io_001 = ScenarioStats::default();
     let mut total_bad_drops = 0usize;
 
-    // Probe the first query with bloom-on to estimate drop_ratio so we can
-    // pick a probe count for iso-I/O 010.
-    let probed_drop_ratio = if probe_nbr_010_iso_io_override > 0 {
+    // Probe the first query with synopsis-on to estimate drop_ratio so we
+    // can pick a probe count for iso-I/O 001.
+    let probed_drop_ratio = if probe_nbr_001_iso_io_override > 0 {
         None
     } else {
         let q = &queries[0];
         let gt = ground_truth(&records, q, &distance_function, &allowed_set, k).await;
         let (_recall, heads_rng, heads_fetched, _lat, _) = run_query(
-            &idx_010.reader,
+            &idx_001.reader,
             q,
             probe_nbr,
             rng_epsilon,
             rng_factor,
             &distance_function,
-            &tokens_010,
+            &pred_on,
             &allowed_signed,
             &allowed_set,
             &gt,
@@ -510,23 +527,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         Some(dr)
     };
-    let probe_nbr_010_iso_io = if probe_nbr_010_iso_io_override > 0 {
-        probe_nbr_010_iso_io_override
+    let probe_nbr_001_iso_io = if probe_nbr_001_iso_io_override > 0 {
+        probe_nbr_001_iso_io_override
     } else {
-        // Fixed-multiplier strategy: probe_nbr / (1 - drop_ratio) with margin.
         let dr = probed_drop_ratio.unwrap_or(0.0).max(0.0).min(0.95);
         let scale = 1.0 / (1.0 - dr).max(0.05);
         ((probe_nbr as f64) * scale).ceil() as usize
     };
     eprintln!(
-        "[bench] iso-I/O probe_nbr_010 = {} (probe_nbr_000 = {})",
-        probe_nbr_010_iso_io, probe_nbr
+        "[bench] iso-I/O probe_nbr_001 = {} (probe_nbr_000 = {})",
+        probe_nbr_001_iso_io, probe_nbr
     );
 
     for (q_idx, query) in queries.iter().enumerate() {
         let gt = ground_truth(&records, query, &distance_function, &allowed_set, k).await;
 
-        // Iso-probe scenarios: same probe_nbr for 000 and 010.
+        // Iso-probe: same probe_nbr for 000 and 001.
         let (recall_000, heads_rng_000, heads_fetched_000, lat_000, bad_000) = run_query(
             &idx_000.reader,
             query,
@@ -534,7 +550,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             rng_epsilon,
             rng_factor,
             &distance_function,
-            &tokens_000,
+            &pred_off,
             &allowed_signed,
             &allowed_set,
             &gt,
@@ -552,39 +568,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         iso_probe_000.heads_fetched_sum += heads_fetched_000;
         iso_probe_000.drop_ratio_sum += dr_000;
         iso_probe_000.latency_ms_sum += lat_000;
+        let _ = bad_000;
 
-        let (recall_010_isoprobe, heads_rng_010_ip, heads_fetched_010_ip, lat_010_ip, bad_010_ip) =
+        let (recall_001_isoprobe, heads_rng_001_ip, heads_fetched_001_ip, lat_001_ip, bad_001_ip) =
             run_query(
-                &idx_010.reader,
+                &idx_001.reader,
                 query,
                 probe_nbr,
                 rng_epsilon,
                 rng_factor,
                 &distance_function,
-                &tokens_010,
+                &pred_on,
                 &allowed_signed,
                 &allowed_set,
                 &gt,
                 k,
             )
             .await;
-        let dr_010_ip = if heads_rng_010_ip > 0 {
-            (heads_rng_010_ip - heads_fetched_010_ip) as f64 / heads_rng_010_ip as f64
+        let dr_001_ip = if heads_rng_001_ip > 0 {
+            (heads_rng_001_ip - heads_fetched_001_ip) as f64 / heads_rng_001_ip as f64
         } else {
             0.0
         };
-        iso_probe_010.queries += 1;
-        iso_probe_010.recall_sum += recall_010_isoprobe;
-        iso_probe_010.heads_rng_sum += heads_rng_010_ip;
-        iso_probe_010.heads_fetched_sum += heads_fetched_010_ip;
-        iso_probe_010.drop_ratio_sum += dr_010_ip;
-        iso_probe_010.latency_ms_sum += lat_010_ip;
-        iso_probe_010.bad_drops += bad_010_ip;
-        total_bad_drops += bad_010_ip;
-        let _ = bad_000;
+        iso_probe_001.queries += 1;
+        iso_probe_001.recall_sum += recall_001_isoprobe;
+        iso_probe_001.heads_rng_sum += heads_rng_001_ip;
+        iso_probe_001.heads_fetched_sum += heads_fetched_001_ip;
+        iso_probe_001.drop_ratio_sum += dr_001_ip;
+        iso_probe_001.latency_ms_sum += lat_001_ip;
+        iso_probe_001.bad_drops += bad_001_ip;
+        total_bad_drops += bad_001_ip;
 
-        // Iso-I/O 000: probe_nbr (same as iso_probe). Reuse those numbers
-        // to avoid double work.
+        // Iso-I/O 000: probe_nbr (same as iso_probe). Reuse.
         iso_io_000.queries += 1;
         iso_io_000.recall_sum += recall_000;
         iso_io_000.heads_rng_sum += heads_rng_000;
@@ -592,37 +607,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         iso_io_000.drop_ratio_sum += dr_000;
         iso_io_000.latency_ms_sum += lat_000;
 
-        // Iso-I/O 010: probe more centroids; gate trims down to ~probe_nbr.
-        let (recall_010_isoio, heads_rng_010_ii, heads_fetched_010_ii, lat_010_ii, bad_010_ii) =
+        // Iso-I/O 001: probe more centroids; gate trims to ~probe_nbr.
+        let (recall_001_isoio, heads_rng_001_ii, heads_fetched_001_ii, lat_001_ii, bad_001_ii) =
             run_query(
-                &idx_010.reader,
+                &idx_001.reader,
                 query,
-                probe_nbr_010_iso_io,
+                probe_nbr_001_iso_io,
                 rng_epsilon,
                 rng_factor,
                 &distance_function,
-                &tokens_010,
+                &pred_on,
                 &allowed_signed,
                 &allowed_set,
                 &gt,
                 k,
             )
             .await;
-        let dr_010_ii = if heads_rng_010_ii > 0 {
-            (heads_rng_010_ii - heads_fetched_010_ii) as f64 / heads_rng_010_ii as f64
+        let dr_001_ii = if heads_rng_001_ii > 0 {
+            (heads_rng_001_ii - heads_fetched_001_ii) as f64 / heads_rng_001_ii as f64
         } else {
             0.0
         };
-        iso_io_010.queries += 1;
-        iso_io_010.recall_sum += recall_010_isoio;
-        iso_io_010.heads_rng_sum += heads_rng_010_ii;
-        iso_io_010.heads_fetched_sum += heads_fetched_010_ii;
-        iso_io_010.drop_ratio_sum += dr_010_ii;
-        iso_io_010.latency_ms_sum += lat_010_ii;
-        iso_io_010.bad_drops += bad_010_ii;
-        total_bad_drops += bad_010_ii;
+        iso_io_001.queries += 1;
+        iso_io_001.recall_sum += recall_001_isoio;
+        iso_io_001.heads_rng_sum += heads_rng_001_ii;
+        iso_io_001.heads_fetched_sum += heads_fetched_001_ii;
+        iso_io_001.drop_ratio_sum += dr_001_ii;
+        iso_io_001.latency_ms_sum += lat_001_ii;
+        iso_io_001.bad_drops += bad_001_ii;
+        total_bad_drops += bad_001_ii;
 
-        // CSV rows (one per (scenario, strategy)).
         writeln!(
             out,
             "{},{},{},{},{},{:.6},{},{},{},{},{},{:.4},{:.4},{},{:.3}",
@@ -651,15 +665,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             q_idx,
             k,
             selectivity,
-            "010",
+            "001",
             "iso_probe",
             probe_nbr,
-            heads_rng_010_ip,
-            heads_fetched_010_ip,
-            dr_010_ip,
-            recall_010_isoprobe,
-            bad_010_ip,
-            lat_010_ip
+            heads_rng_001_ip,
+            heads_fetched_001_ip,
+            dr_001_ip,
+            recall_001_isoprobe,
+            bad_001_ip,
+            lat_001_ip
         )?;
         writeln!(
             out,
@@ -689,15 +703,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             q_idx,
             k,
             selectivity,
-            "010",
+            "001",
             "iso_io",
-            probe_nbr_010_iso_io,
-            heads_rng_010_ii,
-            heads_fetched_010_ii,
-            dr_010_ii,
-            recall_010_isoio,
-            bad_010_ii,
-            lat_010_ii
+            probe_nbr_001_iso_io,
+            heads_rng_001_ii,
+            heads_fetched_001_ii,
+            dr_001_ii,
+            recall_001_isoio,
+            bad_001_ii,
+            lat_001_ii
         )?;
     }
 
@@ -720,35 +734,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!();
-    eprintln!("========== BloomHeads 000 vs 010 ablation ==========");
-    eprintln!("  dataset=sift1m n_records={} buckets={} k={} selectivity={:.4}", n_records, n_buckets, k, selectivity);
+    eprintln!("========== HeadSynopsis 000 vs 001 ablation ==========");
+    eprintln!(
+        "  dataset=sift1m n_records={} buckets={} k={} selectivity={:.4}",
+        n_records, n_buckets, k, selectivity
+    );
     eprintln!("  iso-probe (probe_nbr={}):", probe_nbr);
-    eprintln!("    000 (no bloom): {}", fmt(&iso_probe_000));
-    eprintln!("    010 (bloom):    {}", fmt(&iso_probe_010));
-    if iso_probe_000.queries > 0 && iso_probe_010.queries > 0 {
+    eprintln!("    000 (no synopsis): {}", fmt(&iso_probe_000));
+    eprintln!("    001 (synopsis):    {}", fmt(&iso_probe_001));
+    if iso_probe_000.queries > 0 && iso_probe_001.queries > 0 {
         let r0 = iso_probe_000.recall_sum / iso_probe_000.queries as f64;
-        let r1 = iso_probe_010.recall_sum / iso_probe_010.queries as f64;
-        eprintln!("    Δrecall (010 − 000) = {:+.4}", r1 - r0);
+        let r1 = iso_probe_001.recall_sum / iso_probe_001.queries as f64;
+        eprintln!("    Δrecall (001 − 000) = {:+.4}", r1 - r0);
     }
-    eprintln!("  iso-I/O (probe_nbr_010={}):", probe_nbr_010_iso_io);
-    eprintln!("    000 (no bloom): {}", fmt(&iso_io_000));
-    eprintln!("    010 (bloom):    {}", fmt(&iso_io_010));
-    if iso_io_000.queries > 0 && iso_io_010.queries > 0 {
+    eprintln!("  iso-I/O (probe_nbr_001={}):", probe_nbr_001_iso_io);
+    eprintln!("    000 (no synopsis): {}", fmt(&iso_io_000));
+    eprintln!("    001 (synopsis):    {}", fmt(&iso_io_001));
+    if iso_io_000.queries > 0 && iso_io_001.queries > 0 {
         let r0 = iso_io_000.recall_sum / iso_io_000.queries as f64;
-        let r1 = iso_io_010.recall_sum / iso_io_010.queries as f64;
-        eprintln!("    Δrecall (010 − 000) = {:+.4}", r1 - r0);
+        let r1 = iso_io_001.recall_sum / iso_io_001.queries as f64;
+        eprintln!("    Δrecall (001 − 000) = {:+.4}", r1 - r0);
     }
-    eprintln!("  [gate-audit] total bad_drops across all queries: {}", total_bad_drops);
-    eprintln!("=====================================================");
+    eprintln!(
+        "  [gate-audit] total bad_drops across all queries: {}",
+        total_bad_drops
+    );
+    eprintln!("====================================================");
 
     if total_bad_drops > 0 && panic_on_bad_drop {
         panic!(
-            "Phase 1 contract violation: gate dropped {} heads containing matching docs (recall lost)",
+            "Synopsis correctness contract violation: gate dropped {} heads containing matching docs (recall lost)",
             total_bad_drops
         );
     }
     eprintln!("[bench] wrote {}", output);
-    let _ = (idx_000, idx_010); // keep alive for reader lifetimes
+    let _ = (idx_000, idx_001); // keep alive for reader lifetimes
 
     Ok(())
 }

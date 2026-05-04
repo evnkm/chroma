@@ -8,6 +8,9 @@ use super::types::{
 use chroma_blockstore::provider::BlockfileProvider;
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::spann::head_bloom::{doc_tokens, HeadBloomReadConfig, HeadBloomWriteConfig};
+use chroma_index::spann::head_synopsis::{
+    synopsis_doc_tokens, HeadSynopsisReadConfig, HeadSynopsisWriteConfig,
+};
 use chroma_index::spann::types::GarbageCollectionContext;
 use chroma_index::spann::types::SpannMetrics;
 use chroma_index::spann::types::{
@@ -21,6 +24,7 @@ use chroma_types::Schema;
 use chroma_types::SchemaError;
 use chroma_types::SegmentUuid;
 use chroma_types::HEAD_BLOOM_FILTERS_PATH;
+use chroma_types::HEAD_SYNOPSIS_PATH;
 use chroma_types::HNSW_PATH;
 use chroma_types::MAX_HEAD_ID_BF_PATH;
 use chroma_types::POSTING_LIST_PATH;
@@ -115,6 +119,9 @@ impl SpannSegmentWriterShard {
         head_bloom_capacity_factor: u32,
         head_bloom_doc_tokens_cache: bool,
         head_bloom_commit_rebuild: bool,
+        head_synopsis_enabled: bool,
+        head_synopsis_top_k_per_key: u32,
+        head_synopsis_max_cardinality: u32,
     ) -> Result<SpannSegmentWriterShard, SpannSegmentWriterShardError> {
         if segment.r#type != SegmentType::Spann || segment.scope != SegmentScope::VECTOR {
             return Err(SpannSegmentWriterShardError::InvalidArgument);
@@ -200,6 +207,20 @@ impl SpannSegmentWriterShard {
             None
         };
 
+        let head_synopsis_blob_path: Option<String> = segment
+            .file_path
+            .get(HEAD_SYNOPSIS_PATH)
+            .cloned();
+        let head_synopsis_config = if head_synopsis_enabled {
+            Some(HeadSynopsisWriteConfig {
+                top_k_per_key: head_synopsis_top_k_per_key.max(1),
+                max_cardinality: head_synopsis_max_cardinality.max(1),
+                existing_blob_path: head_synopsis_blob_path.as_deref(),
+            })
+        } else {
+            None
+        };
+
         let index_writer = match SpannIndexWriter::from_id(
             hnsw_provider,
             hnsw_id.as_ref(),
@@ -216,6 +237,7 @@ impl SpannSegmentWriterShard {
             metrics,
             cmek,
             head_bloom_config,
+            head_synopsis_config,
         )
         .await
         {
@@ -237,16 +259,23 @@ impl SpannSegmentWriterShard {
         &self,
         record: &HydratedMaterializedLogRecord<'_, '_>,
     ) -> Result<(), SpannSegmentWriterShardError> {
-        let tokens = if self.index.head_bloom_enabled {
-            doc_tokens(&record.merged_metadata())
+        let metadata = record.merged_metadata();
+        let bloom_tokens = if self.index.head_bloom_enabled {
+            doc_tokens(&metadata)
+        } else {
+            Vec::new()
+        };
+        let synopsis_tokens = if self.index.head_synopsis_enabled {
+            synopsis_doc_tokens(&metadata)
         } else {
             Vec::new()
         };
         self.index
-            .add_with_metadata_tokens(
+            .add_with_metadata_tokens_and_synopsis(
                 record.get_offset_id(),
                 record.merged_embeddings_ref(),
-                &tokens,
+                &bloom_tokens,
+                &synopsis_tokens,
             )
             .await
             .map_err(|e| {
@@ -272,16 +301,23 @@ impl SpannSegmentWriterShard {
         &self,
         record: &HydratedMaterializedLogRecord<'_, '_>,
     ) -> Result<(), SpannSegmentWriterShardError> {
-        let tokens = if self.index.head_bloom_enabled {
-            doc_tokens(&record.merged_metadata())
+        let metadata = record.merged_metadata();
+        let bloom_tokens = if self.index.head_bloom_enabled {
+            doc_tokens(&metadata)
+        } else {
+            Vec::new()
+        };
+        let synopsis_tokens = if self.index.head_synopsis_enabled {
+            synopsis_doc_tokens(&metadata)
         } else {
             Vec::new()
         };
         self.index
-            .update_with_metadata_tokens(
+            .update_with_metadata_tokens_and_synopsis(
                 record.get_offset_id(),
                 record.merged_embeddings_ref(),
-                &tokens,
+                &bloom_tokens,
+                &synopsis_tokens,
             )
             .await
             .map_err(|e| {
@@ -433,6 +469,12 @@ impl SpannSegmentFlusherShard {
                         vec![blob_path.clone()],
                     );
                 }
+                if let Some(blob_path) = index_ids.head_synopsis_blob_path.as_ref() {
+                    index_id_map.insert(
+                        HEAD_SYNOPSIS_PATH.to_string(),
+                        vec![blob_path.clone()],
+                    );
+                }
                 tracing::info!(
                     segment_id = %self.id,
                     collection_version = self.collection_version,
@@ -568,6 +610,17 @@ impl<'me> SpannSegmentReaderShard<'me> {
                 blob_path: Some(p.as_str()),
             });
 
+        let head_synopsis_blob_path: Option<String> = segment
+            .file_path
+            .get(HEAD_SYNOPSIS_PATH)
+            .cloned();
+        let head_synopsis_config =
+            head_synopsis_blob_path
+                .as_ref()
+                .map(|p| HeadSynopsisReadConfig {
+                    blob_path: Some(p.as_str()),
+                });
+
         let index_reader = match Box::pin(SpannIndexReader::from_id(
             hnsw_id.as_ref(),
             hnsw_provider,
@@ -582,6 +635,7 @@ impl<'me> SpannSegmentReaderShard<'me> {
             adaptive_search_nprobe,
             params,
             head_bloom_config,
+            head_synopsis_config,
         ))
         .await
         {
@@ -647,6 +701,18 @@ impl<'me> SpannSegmentReaderShard<'me> {
         tokens: &chroma_index::spann::head_bloom::EqualityTokens,
     ) -> Vec<usize> {
         self.index_reader.gate_heads(candidate_head_ids, tokens)
+    }
+
+    /// Drop heads whose per-head synopsis provably has zero matches for the
+    /// predicate. No-op when no synopsis is loaded or the predicate isn't
+    /// gateable.
+    pub fn gate_heads_synopsis(
+        &self,
+        candidate_head_ids: &[usize],
+        predicate: &chroma_index::spann::head_synopsis::SynopsisPredicate,
+    ) -> Vec<usize> {
+        self.index_reader
+            .gate_heads_synopsis(candidate_head_ids, predicate)
     }
 }
 
@@ -761,6 +827,9 @@ mod test {
             4,
             false,
             false,
+            false,
+            64,
+            1024,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -866,6 +935,9 @@ mod test {
             4,
             false,
             false,
+            false,
+            64,
+            1024,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -1008,6 +1080,9 @@ mod test {
             4,
             false,
             false,
+            false,
+            64,
+            1024,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -1200,6 +1275,9 @@ mod test {
             4,
             false,
             false,
+            false,
+            64,
+            1024,
         )
         .await
         .expect("Error creating spann segment writer");
@@ -1312,6 +1390,9 @@ mod test {
             4,
             false,
             false,
+            false,
+            64,
+            1024,
         )
         .await
         .expect("Error creating spann segment writer");

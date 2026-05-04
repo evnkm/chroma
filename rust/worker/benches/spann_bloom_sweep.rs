@@ -306,6 +306,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SpannMetrics::default(),
         None,
         head_bloom_config,
+        None,
     )
     .await
     .expect("spann writer");
@@ -340,6 +341,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         false,
         params,
         head_bloom_read,
+        None,
     ))
     .await
     .expect("spann reader");
