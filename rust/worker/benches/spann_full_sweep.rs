@@ -413,7 +413,13 @@ struct CellRow {
     drop_ratio: f64,
     candidates_before_filter: usize,
     candidates_after_filter: usize,
+    /// Time for the production code path only: probe + gate + BfPL + merge.
+    /// Excludes the gate-audit, which is not part of the production query
+    /// pipeline.
     latency_ms: f64,
+    /// Time for the audit alone (PL re-fetches of dropped heads + scan).
+    /// Reported separately for visibility; not part of `latency_ms`.
+    audit_ms: f64,
     bad_drops: usize,
     nprobe_used: u32,
 }
@@ -435,6 +441,7 @@ async fn run_query_for_cell(
     gt: &[u32],
     k: usize,
 ) -> CellRow {
+    // ── Production query pipeline (timed) ──────────────────────────────
     let t0 = Instant::now();
 
     // Probe budget: production logic. determine_search_nprobe combines the
@@ -469,28 +476,13 @@ async fn run_query_for_cell(
     let heads_fetched = kept.len();
     let kept_set: HashSet<usize> = kept.iter().copied().collect();
 
-    // Audit: any head dropped that contained a matching doc?
-    let mut bad_drops = 0usize;
-    for h in &head_ids {
-        if kept_set.contains(h) {
-            continue;
-        }
-        let pl = reader
-            .fetch_posting_list(*h as u32)
-            .await
-            .expect("fetch pl");
-        if pl.iter().any(|p| allowed_set.contains(&p.doc_offset_id)) {
-            bad_drops += 1;
-        }
-    }
-
     // Run BfPL on kept heads + merge.
     let mut merge_list = Vec::new();
     let mut candidates_before: usize = 0;
     let mut candidates_after: usize = 0;
-    for head_id in kept {
+    for head_id in &kept {
         let pl = reader
-            .fetch_posting_list(head_id as u32)
+            .fetch_posting_list(*head_id as u32)
             .await
             .expect("fetch pl");
         candidates_before += pl.len();
@@ -518,6 +510,9 @@ async fn run_query_for_cell(
         .await
         .expect("merge");
 
+    let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // ── End production-timed region ────────────────────────────────────
+
     let returned: HashSet<u32> = merged.measures.iter().map(|r| r.offset_id).collect();
     let hits = gt.iter().filter(|id| returned.contains(id)).count();
     let recall = if gt.is_empty() {
@@ -530,7 +525,27 @@ async fn run_query_for_cell(
     } else {
         0.0
     };
-    let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Bench-only audit (NOT timed as production cost) ────────────────
+    // Re-fetch every dropped head's PL and scan for matching docs. This is
+    // a correctness check that wouldn't run in production. Reported as a
+    // separate `audit_ms` metric so it's visible without polluting the
+    // production-latency comparison across cells.
+    let audit_t0 = Instant::now();
+    let mut bad_drops = 0usize;
+    for h in &head_ids {
+        if kept_set.contains(h) {
+            continue;
+        }
+        let pl = reader
+            .fetch_posting_list(*h as u32)
+            .await
+            .expect("fetch pl");
+        if pl.iter().any(|p| allowed_set.contains(&p.doc_offset_id)) {
+            bad_drops += 1;
+        }
+    }
+    let audit_ms = audit_t0.elapsed().as_secs_f64() * 1000.0;
 
     CellRow {
         recall,
@@ -540,6 +555,7 @@ async fn run_query_for_cell(
         candidates_before_filter: candidates_before,
         candidates_after_filter: candidates_after,
         latency_ms,
+        audit_ms,
         bad_drops,
         nprobe_used: probe_nbr as u32,
     }
@@ -558,6 +574,7 @@ struct CellAgg {
     candidates_after_sum: usize,
     latency_sum: f64,
     latency_p99: f64,
+    audit_sum: f64,
     bad_drops: usize,
     nprobe_max: u32,
     latencies: Vec<f64>,
@@ -573,6 +590,7 @@ impl CellAgg {
         self.candidates_before_sum += row.candidates_before_filter;
         self.candidates_after_sum += row.candidates_after_filter;
         self.latency_sum += row.latency_ms;
+        self.audit_sum += row.audit_ms;
         self.bad_drops += row.bad_drops;
         if row.nprobe_used > self.nprobe_max {
             self.nprobe_max = row.nprobe_used;
@@ -594,7 +612,7 @@ impl CellAgg {
             return "n/a".into();
         }
         format!(
-            "rec={:.4} hrng={:.1} hfet={:.1} drop={:.4} c_b={:.0} c_a={:.0} lat={:.2}ms p99={:.2}ms bad={} np_max={}",
+            "rec={:.4} hrng={:.1} hfet={:.1} drop={:.4} c_b={:.0} c_a={:.0} lat={:.2}ms p99={:.2}ms audit={:.2}ms bad={} np_max={}",
             self.recall_sum / self.queries as f64,
             self.heads_rng_sum as f64 / self.queries as f64,
             self.heads_fetched_sum as f64 / self.queries as f64,
@@ -603,6 +621,7 @@ impl CellAgg {
             self.candidates_after_sum as f64 / self.queries as f64,
             self.latency_sum / self.queries as f64,
             self.latency_p99,
+            self.audit_sum / self.queries as f64,
             self.bad_drops,
             self.nprobe_max,
         )
@@ -722,7 +741,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(File::create(&output)?);
     writeln!(
         out,
-        "dataset,n_records,dim,query_id,k,selectivity,cell,adaptive,bloom,synopsis,nprobe_used,heads_rng,heads_fetched,drop_ratio,recall_at_k,candidates_before_filter,candidates_after_filter,latency_ms,bad_drops"
+        "dataset,n_records,dim,query_id,k,selectivity,cell,adaptive,bloom,synopsis,nprobe_used,heads_rng,heads_fetched,drop_ratio,recall_at_k,candidates_before_filter,candidates_after_filter,latency_ms,audit_ms,bad_drops"
     )?;
 
     let mut aggs: std::collections::HashMap<&'static str, CellAgg> =
@@ -755,7 +774,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             writeln!(
                 out,
-                "{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{:.4},{:.4},{},{},{:.3},{}",
+                "{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{:.4},{:.4},{},{},{:.3},{:.3},{}",
                 dataset_label,
                 n_records,
                 dim,
@@ -774,6 +793,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 row.candidates_before_filter,
                 row.candidates_after_filter,
                 row.latency_ms,
+                row.audit_ms,
                 row.bad_drops
             )?;
         }
