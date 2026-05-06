@@ -243,8 +243,18 @@ async fn build_one(
         Some(HeadBloomWriteConfig {
             capacity_per_head: capacity,
             existing_blob_path: None,
-            doc_tokens_cache_enabled: false,
-            commit_rebuild_enabled: false,
+            // Doc-tokens cache + commit-rebuild are required for bloom to
+            // survive centroid splits during indexing. Without them,
+            // every reassign during a split calls `handle_reassign_bloom`
+            // which marks the head stale (since metadata_tokens is None
+            // on the reassign path), and `iter_non_stale()` ends up
+            // returning zero filters — the persisted bloom blob is empty
+            // and the gate degrades to keep-everything. With doc_tokens
+            // enabled the tokens are remembered per doc; with
+            // commit_rebuild enabled, every touched head's bloom is
+            // rebuilt from PL × doc-tokens at commit time.
+            doc_tokens_cache_enabled: true,
+            commit_rebuild_enabled: true,
         })
     } else {
         None

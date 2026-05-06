@@ -23,25 +23,25 @@ Show
 
 Type "python demo/tui.py"
 Enter
-Sleep 5s
+Sleep 6s
 
-# Query 1: realistic predicate, dramatic.
-Type "how does photosynthesis work"
+# Query 1: realistic predicate. "how to" naturally aligns with wikihow.com docs.
+Type "how to keep a houseplant alive"
 Enter
-Sleep 500ms
-# Pick preset 1: source_domain = wikihow.com.
+Sleep 800ms
+# Pick preset 1: source_domain = wikihow.com (0.74% selectivity).
 Type "1"
 Enter
-Sleep 4s
+Sleep 5s
 
-# Query 2: synthetic 0.1% killer case.
+# Query 2: synthetic 0.1% killer case (matches paper headline).
 Type "what causes ocean tides"
 Enter
-Sleep 500ms
-# Pick preset 4: synthetic topic_bucket = 0.
+Sleep 800ms
+# Pick preset 4: synthetic topic_bucket = 0 (0.1% selectivity).
 Type "4"
 Enter
-Sleep 4s
+Sleep 5s
 
 # Quit.
 Type "q"
