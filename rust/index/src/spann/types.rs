@@ -3264,9 +3264,11 @@ pub struct SpannPosting {
 pub const ADAPTIVE_NPROBE_EPSILON: f64 = 0.001;
 
 /// Maximum multiplicative boost over `base_nprobe` allowed when the filter is
-/// very selective. With epsilon=0.001 and max_factor=8, the cap is reached at
-/// sel ≈ 0.125 and below.
-pub const ADAPTIVE_NPROBE_MAX_FACTOR: f64 = 8.0;
+/// very selective. With epsilon=0.001 and max_factor=16, the cap is reached at
+/// sel ≈ 0.0625 and below. Tuned upward from the original 8× to let the
+/// boost actually fire at sub-1% selectivities (where 8× saturates almost
+/// instantly and adaptive can no longer respond to tighter filters).
+pub const ADAPTIVE_NPROBE_MAX_FACTOR: f64 = 16.0;
 
 /// Filter-selectivity-aware boost on top of a size-based nprobe.
 /// Returns `base_nprobe` unchanged when there is no filter (None) or when
@@ -3582,15 +3584,22 @@ impl<'me> SpannIndexReader<'me> {
     ) -> u32 {
         // Query at least 20x more points than k.
         let min_nprobe = ((k * 20) as f64 / self.params.split_threshold as f64).ceil() as u32;
-        // Size-based adaptation (existing behavior).
+        // Size-based adaptation. Re-tuned (previous 24/32/64 at 500K/1M/>1M
+        // *under-shot* the typical baseline params.search_nprobe=32 at
+        // sub-million scales — turning on `adaptive_search_nprobe`
+        // regressed recall instead of helping). New tier values 32/64/128
+        // at 100K/1M/>1M are floored against `params.search_nprobe` so
+        // adaptive can never undershoot the configured base. See
+        // `paper.md` §5.1 for the empirical write-up.
         let size_based = if self.adaptive_search_nprobe {
-            if collection_num_records_post_compaction <= 500000 {
-                24
-            } else if collection_num_records_post_compaction <= 1000000 {
+            let tier = if collection_num_records_post_compaction <= 100_000 {
                 32
-            } else {
+            } else if collection_num_records_post_compaction <= 1_000_000 {
                 64
-            }
+            } else {
+                128
+            };
+            tier.max(self.params.search_nprobe)
         } else {
             self.params.search_nprobe
         };
