@@ -14,6 +14,14 @@ path = "src/bin/compaction_service.rs"
 name = "query_service"
 path = "src/bin/query_service.rs"
 
+[[bin]]
+name = "spann_demo_build"
+path = "src/bin/demo/spann_demo_build.rs"
+
+[[bin]]
+name = "spann_demo"
+path = "src/bin/demo/spann_demo.rs"
+
 [dependencies]
 chroma-tracing = { workspace = true }
 regex = { workspace = true }
@@ -48,6 +56,7 @@ clap = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 sprs = { workspace = true }
 
+chroma-benchmark = { workspace = true }
 chroma-blockstore = { workspace = true }
 chroma-cache = { workspace = true }
 chroma-config = { workspace = true }
@@ -64,10 +73,13 @@ chroma-types = { workspace = true }
 chroma-jemalloc-pprof-server = { workspace = true }
 s3heap = { workspace = true }
 s3heap-service = { workspace = true }
+tempfile = { workspace = true }
 wal3 = { workspace = true }
 
 fastrace = "=0.7.8"
 fastrace-opentelemetry = "=0.8.1"
+
+anyhow = { workspace = true }
 
 [dev-dependencies]
 random-port = { workspace = true }
@@ -79,10 +91,7 @@ proptest-state-machine = { workspace = true }
 shuttle = { workspace = true }
 rand = { workspace = true }
 rand_xorshift = { workspace = true }
-tempfile = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-
-chroma-benchmark = { workspace = true }
 
 [[bench]]
 name = "filter"

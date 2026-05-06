@@ -47,3 +47,6 @@ target/
 testdata
 
 .claude
+
+# SPANN demo: large cached corpora and per-cell index dirs.
+demo/data/
