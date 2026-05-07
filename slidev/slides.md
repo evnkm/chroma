@@ -894,6 +894,65 @@ The demo query (MS MARCO, domain="wikihow") makes the case concrete.
 </div>
 <div class="footer-rule"><span>11 · why it matters</span></div>
 ---
+layout: default
+transition: fade
+---
+<!-- =====================================================================
+SLIDE 12b — SUMMARY
+Recap of the three gates and the headline numbers.
+===================================================================== -->
+<div class="absolute inset-0 px-20 pt-16 pb-16 flex flex-col">
+  <div class="mb-8">
+    <div class="eyebrow mb-3">summary</div>
+    <h2 class="serif text-4xl">
+      Three gates on the routing stage of SPANN.
+    </h2>
+  </div>
+  <div class="grid grid-cols-3 gap-8 flex-1">
+    <div class="border-l-2 pl-6 flex flex-col" style="border-color: var(--rule)">
+      <div class="bignum" style="color: var(--query)">1</div>
+      <div class="serif text-2xl mt-2">Adaptive nprobe</div>
+      <!-- <div class="text-sm mt-3" style="color: var(--ink-soft)">
+        Probe more clusters when the filter is selective. Scales inversely with
+        selectivity, capped at 8× the base.
+      </div> -->
+    </div>
+    <div class="border-l-2 pl-6 flex flex-col" style="border-color: var(--rule)">
+      <div class="bignum" style="color: var(--query)">2</div>
+      <div class="serif text-2xl mt-2">Bloom-filter gate</div>
+      <!-- <div class="text-sm mt-3" style="color: var(--ink-soft)">
+        Per-cluster bloom over metadata values. Skip the fetch when the
+        predicate provably can't match.
+      </div> -->
+    </div>
+    <div class="border-l-2 pl-6 flex flex-col" style="border-color: var(--rule)">
+      <div class="bignum" style="color: var(--query)">3</div>
+      <div class="serif text-2xl mt-2">Metadata synopses</div>
+      <!-- <div class="text-sm mt-3" style="color: var(--ink-soft)">
+        Exact per-value counts per cluster. Zero counts → guaranteed skip,
+        no false positives.
+      </div> -->
+    </div>
+  </div>
+  <div class="mt-8 rounded-sm px-8 py-5 flex items-center justify-between"
+       style="background: #F4F6FB; border: 1px solid var(--rule)">
+    <div>
+      <div class="eyebrow mb-1">winner</div>
+      <div class="serif text-2xl">
+        <span style="color: var(--query)">Adaptive + bloom</span>
+        is the best of the lot.
+      </div>
+    </div>
+    <div class="mono text-sm text-right" style="color: var(--ink-soft)">
+      <span style="color: var(--ink); font-weight: 500">0.958</span> recall@10
+      &nbsp;·&nbsp;
+      <span style="color: var(--ink); font-weight: 500">8.2 ms</span> mean latency<br/>
+      <span style="font-size: 0.72rem">SIFT1M · N = 1M · 1% filter selectivity</span>
+    </div>
+  </div>
+</div>
+<div class="footer-rule"><span>12 · summary</span></div>
+---
 layout: center
 transition: slide-up
 ---
