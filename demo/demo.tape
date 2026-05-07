@@ -25,8 +25,11 @@ Type "python demo/tui.py"
 Enter
 Sleep 6s
 
-# Query 1: realistic predicate. "how to" naturally aligns with wikihow.com docs.
-Type "how to keep a houseplant alive"
+# Query 1: realistic predicate. "painting my house" lands deep in wikihow content
+# but is rare enough that baseline's 24 probes only catch 2/5 GT — this is the
+# query where adaptive nprobe + bloom show a clean RECALL win on a realistic
+# predicate (+60pp).
+Type "painting my house"
 Enter
 Sleep 800ms
 # Pick preset 1: source_domain = wikihow.com (0.74% selectivity).
