@@ -532,7 +532,7 @@ Click 4: stage swaps to Pareto plot
           A predicate hits the table directly. If the count is provably zero, skip.
         </div>
         <div v-click="3" class="text-sm leading-snug" style="color: var(--ink-soft)">
-          No false positives. No false negatives. ~9 MB total for 100K docs.
+          No false positives. No false negatives. ~94 MB total for 1M docs.
         </div>
       </div>
       <!-- RIGHT: synopsis table for a cluster -->
@@ -599,7 +599,7 @@ Click 4: stage swaps to Pareto plot
     </div>
     <!-- Stage B: side-by-side recall + latency bars, appears on click 4 -->
     <div v-click="4" class="absolute inset-0 flex flex-col px-4">
-      <h2 class="serif text-4xl mb-8">Results.</h2>
+      <div class="serif italic text-2xl mb-6" style="color: var(--ink-soft)">results</div>
       <div class="flex-1 grid grid-cols-2 gap-16 items-center">
       <div class="flex flex-col items-center">
         <div class="eyebrow mb-6 self-start">recall@10</div>
@@ -628,6 +628,7 @@ Click 4: stage swaps to Pareto plot
           :decimals="2"
           caption="↓ mean query latency · lower is better"
         />
+      </div>
       </div>
     </div>
   </div>
@@ -673,7 +674,7 @@ See slide_bloom_gate.md for the click-by-click VO mapping.
       </div>
       <div v-click="2" class="flex flex-col items-center">
         <div class="serif italic text-sm mb-3" style="color: var(--ink-soft)">
-          bloom filter · <span class="mono" style="color: var(--ink)">12 KB</span>
+          bloom filter · <span class="mono" style="color: var(--ink)">2 KB</span>
         </div>
         <div class="flex gap-[3px]">
           <div v-for="(bit, i) in bloomBits" :key="i"
@@ -783,27 +784,35 @@ layout: default
 transition: fade
 ---
 <!-- =====================================================================
-SLIDE 9b — BLOOM RESULT
-Continuation of slide 9; bars now updated.
+SLIDE 9b — FINAL RESULTS COMPARISON
+All 8 strategy combinations on SIFT1M, N=1M, 1% selectivity.
 ===================================================================== -->
-<div class="absolute inset-0 flex flex-col justify-center px-24">
-  <div class="eyebrow mb-6">approach 2 · result</div>
-  <div class="grid grid-cols-12 gap-16 items-center">
-    <div class="col-span-5">
-      <h2 class="serif">Recall climbs.<br/>I/O stays flat.</h2>
-    </div>
-    <div class="col-span-7">
-      <RecallBars
-        :rows="[
-          { label: 'baseline',          value: 0.52, color: '#D14A4A' },
-          { label: 'adaptive nprobe',   value: 0.73, color: '#7B8AAE' },
-          { label: 'adaptive + bloom',  value: 0.71, color: '#2E5BFF', highlight: true },
-        ]"
-      />
-    </div>
+<div class="absolute inset-0 flex flex-col px-16 pt-16 pb-16">
+  <div class="mb-6">
+    <div class="eyebrow mb-3">final results</div>
+    <h2 class="serif text-4xl">
+      Combine the gates:
+      <span style="color: var(--query)">Adaptive</span>
+      +
+      <span style="color: var(--query)">Bloom filters</span>
+      ideal
+    </h2>
+  </div>
+  <div class="flex-1 grid grid-cols-2 gap-8 items-center min-h-0">
+    <img src="/plots/recall_1M_sel1pct.png"
+         class="w-full h-full object-contain rounded-sm"
+         style="border: 1px solid var(--rule)"
+         alt="Recall by strategy — SIFT1M, N=1M, 1% filter selectivity"/>
+    <img src="/plots/latency_1M_sel1pct.png"
+         class="w-full h-full object-contain rounded-sm"
+         style="border: 1px solid var(--rule)"
+         alt="Latency by strategy — SIFT1M, N=1M, 1% filter selectivity"/>
+  </div>
+  <div class="caption mt-4 text-center">
+    SIFT1M · N = 1M · 1% filter selectivity · k = 10 · all eight gate combinations
   </div>
 </div>
-<div class="footer-rule"><span>8 · approach 2: bloom filters</span></div>
+<div class="footer-rule"><span>9 · final results</span></div>
 ---
 layout: default
 transition: fade
@@ -811,29 +820,19 @@ transition: fade
 <!-- =====================================================================
 SLIDE 11 — DEMO
 3:30 – 4:10
-Mostly silent. Replace with screen recording.
+Title card — switch to live demo after this slide.
 ===================================================================== -->
 <div class="absolute inset-0 flex flex-col justify-center items-center px-24">
-  <div class="eyebrow mb-8">live · chromadb on sift1m</div>
-  <div class="grid grid-cols-2 gap-8 w-full max-w-6xl">
-    <div class="border" style="border-color: var(--rule); background: #0B0E14; aspect-ratio: 16/10">
-      <div class="p-6 mono text-sm" style="color: #93A3C7">
-        <div class="opacity-60">$ chromadb query --baseline</div>
-        <div class="mt-4" style="color: #F5F3EE">latency  &nbsp;<span style="color: #FF8A8A">240 ms</span></div>
-        <div>fetched&nbsp;&nbsp;<span style="color: #FF8A8A">256 clusters</span></div>
-      </div>
-    </div>
-    <div class="border" style="border-color: var(--rule); background: #0B0E14; aspect-ratio: 16/10">
-      <div class="p-6 mono text-sm" style="color: #93A3C7">
-        <div class="opacity-60">$ chromadb query --gate=synopsis</div>
-        <div class="mt-4" style="color: #F5F3EE">latency  &nbsp;<span style="color: #57D996">68 ms</span></div>
-        <div>fetched&nbsp;&nbsp;<span style="color: #57D996">[DROP_PCT_PLACEHOLDER] clusters</span></div>
-      </div>
-    </div>
+  <div class="eyebrow mb-10">interlude</div>
+  <h1 class="serif text-center" style="font-size: 6rem; line-height: 1">
+    <span style="color: var(--query)">demo.</span>
+  </h1>
+  <div class="rule mt-12"></div>
+  <div class="caption mt-6 text-center">
+    MS MARCO dataset
   </div>
-  <div class="caption mt-8">screen-recording goes here · same query, same answers, ~4× fewer fetches</div>
 </div>
-<div class="footer-rule"><span>9 · demo</span></div>
+<div class="footer-rule"><span>10 · demo</span></div>
 ---
 layout: default
 transition: fade
@@ -841,29 +840,59 @@ transition: fade
 <!-- =====================================================================
 SLIDE 12 — WHY IT MATTERS
 4:10 – 4:35
+Connect the SIFT1M numbers to the real workload Chroma serves: RAG.
+The demo query (MS MARCO, domain="wikihow") makes the case concrete.
 ===================================================================== -->
-<div class="absolute inset-0 flex flex-col justify-center px-24">
-  <div class="eyebrow mb-6">why fewer fetches matter</div>
-  <h2 class="serif mb-12 max-w-4xl">
-    In production, posting lists live on object storage.<br/>
-    Every fetch is a network round-trip.
-  </h2>
-  <div class="grid grid-cols-3 gap-12 max-w-5xl">
-    <div>
-      <div class="bignum" style="color: var(--query)">~4×</div>
-      <div class="text-base mt-2" style="color: var(--ink-soft)">fewer fetches</div>
+<div class="absolute inset-0 px-20 pt-16 pb-16 flex flex-col">
+  <div class="mb-8">
+    <div class="eyebrow mb-3">why this matters</div>
+    <h2 class="serif text-4xl max-w-4xl">
+      Chroma's biggest workload is
+      <span style="color: var(--query)">RAG</span> —
+      and almost every RAG query is
+      <span style="color: var(--miss)">predicate-filtered</span>.
+    </h2>
+  </div>
+  <div class="grid grid-cols-12 gap-10 flex-1 items-stretch">
+    <!-- LEFT: the RAG predicate reality -->
+    <div class="col-span-7 flex flex-col gap-5 justify-center">
+      <div class="text-base leading-relaxed" style="color: var(--ink-soft)">
+        Retrieval rarely runs over the whole corpus. The agent already knows
+        the user, the tenant, the document set, the language, the recency
+        window — and bakes that into a
+        <span class="mono" style="color: var(--ink)">where</span> clause.
+      </div>
+      <div class="rounded-sm px-5 py-4 mono text-sm"
+           style="background: #F4F6FB; border: 1px solid var(--rule); color: var(--ink); line-height: 1.6">
+        <span style="color: #7B8AAE"># our demo: a wikiHow-style RAG retrieval</span><br/>
+        <span style="color: #7B8AAE">collection</span>.query(<br/>
+        &nbsp;&nbsp;query_texts=[<span style="color: var(--query)">"how do I unclog a drain?"</span>],<br/>
+        &nbsp;&nbsp;n_results=<span style="color: var(--query)">10</span>,<br/>
+        &nbsp;&nbsp;<span style="background: #FFF7CC; padding: 0 0.2rem; border-radius: 2px">where={<span style="color: var(--miss)">"domain"</span>: <span style="color: var(--miss)">"wikihow.com"</span>},</span><br/>
+        )
+      </div>
     </div>
-    <div>
-      <div class="bignum" style="color: var(--query)">~4×</div>
-      <div class="text-base mt-2" style="color: var(--ink-soft)">lower tail latency</div>
-    </div>
-    <div>
-      <div class="bignum" style="color: var(--query)">~4×</div>
-      <div class="text-base mt-2" style="color: var(--ink-soft)">lower S3 bill</div>
+    <!-- RIGHT: the two things that move -->
+    <div class="col-span-5 flex flex-col gap-6 justify-center">
+      <div>
+        <div class="eyebrow mb-2" style="color: var(--match)">why recall matters</div>
+        <div class="serif text-2xl mb-1">The model only sees what we retrieve.</div>
+        <div class="text-sm leading-snug" style="color: var(--ink-soft)">
+          Lost neighbors → wrong context → hallucinations. 
+        </div>
+      </div>
+      <div class="rule"></div>
+      <div>
+        <div class="eyebrow mb-2" style="color: var(--query)">why latency matters</div>
+        <div class="serif text-2xl mb-1">Retrieval blocks the first token.</div>
+        <div class="text-sm leading-snug" style="color: var(--ink-soft)">
+          Every ms here is a ms the user waits before the LLM streams
+        </div>
+      </div>
     </div>
   </div>
 </div>
-<div class="footer-rule"><span>10 · production impact</span></div>
+<div class="footer-rule"><span>11 · why it matters</span></div>
 ---
 layout: center
 transition: slide-up
