@@ -3584,32 +3584,32 @@ impl<'me> SpannIndexReader<'me> {
     ) -> u32 {
         // Query at least 20x more points than k.
         let min_nprobe = ((k * 20) as f64 / self.params.split_threshold as f64).ceil() as u32;
-        // Size-based adaptation. Re-tuned (previous 24/32/64 at 500K/1M/>1M
-        // *under-shot* the typical baseline params.search_nprobe=32 at
-        // sub-million scales — turning on `adaptive_search_nprobe`
-        // regressed recall instead of helping). New tier values 32/64/128
-        // at 100K/1M/>1M are floored against `params.search_nprobe` so
-        // adaptive can never undershoot the configured base. See
-        // `paper.md` §5.1 for the empirical write-up.
-        let size_based = if self.adaptive_search_nprobe {
-            let tier = if collection_num_records_post_compaction <= 100_000 {
-                32
-            } else if collection_num_records_post_compaction <= 1_000_000 {
-                64
-            } else {
-                128
-            };
-            tier.max(self.params.search_nprobe)
-        } else {
-            self.params.search_nprobe
-        };
-        // Filter-aware boost: probe more centers when the metadata filter is
-        // restrictive so enough candidates survive the bitmask. Composes with
-        // the size-based adaptation above. No-op when filter_selectivity is
-        // None (no filter) or 1.0 (filter passes everything).
-        let filter_aware = filter_aware_nprobe(size_based, filter_selectivity);
 
-        filter_aware.max(min_nprobe)
+        // Size-based gradient (upstream Chroma PR #5185 + #5226). ALWAYS on —
+        // this is the baseline behavior. Values 24/32/64 at thresholds
+        // 500K/1M/>1M match upstream exactly. No floor over
+        // `params.search_nprobe`: when adaptive is on, the tier replaces
+        // the configured base (upstream's behavior).
+        let size_based = if collection_num_records_post_compaction <= 500_000 {
+            24
+        } else if collection_num_records_post_compaction <= 1_000_000 {
+            32
+        } else {
+            64
+        };
+
+        // Filter-aware boost (this project's contribution). Gated by
+        // `adaptive_search_nprobe`. When OFF, no selectivity scaling is
+        // applied — query gets the upstream-baseline probe count. When
+        // ON, `nprobe` scales as `size_based / selectivity`, capped at
+        // `size_based × MAX_FACTOR` (= 16).
+        let nprobe = if self.adaptive_search_nprobe {
+            filter_aware_nprobe(size_based, filter_selectivity)
+        } else {
+            size_based
+        };
+
+        nprobe.max(min_nprobe)
     }
 
     pub async fn rng_query(
