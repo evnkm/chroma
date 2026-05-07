@@ -78,6 +78,22 @@ class CellState:
     synopsis_dropped: Optional[int] = None
 
 
+def _features_label(features: dict | None) -> str:
+    """Produce a human-readable suffix from a {"adaptive","bloom","synopsis"} dict."""
+    if not features:
+        return ""
+    parts = []
+    if features.get("adaptive"):
+        parts.append("adaptive")
+    if features.get("bloom"):
+        parts.append("bloom")
+    if features.get("synopsis"):
+        parts.append("synopsis")
+    if not parts:
+        return "none"
+    return " + ".join(parts)
+
+
 @dataclass
 class RaceState:
     query_text: str = ""
@@ -89,6 +105,8 @@ class RaceState:
     baseline: CellState = field(default_factory=lambda: CellState("baseline"))
     optimized: CellState = field(default_factory=lambda: CellState("optimized"))
     started_at: float = 0.0
+    baseline_label: str = "Baseline (000)"
+    optimized_label: str = "Optimized"
 
 
 def fmt_lat(ms: float) -> str:
@@ -225,8 +243,8 @@ def render_layout(race: RaceState) -> Layout:
         Layout(name="baseline"),
         Layout(name="optimized"),
     )
-    cells["baseline"].update(render_cell_panel("Baseline (000)", race.baseline, race, "red"))
-    cells["optimized"].update(render_cell_panel("Optimized (111)", race.optimized, race, "green"))
+    cells["baseline"].update(render_cell_panel(race.baseline_label, race.baseline, race, "red"))
+    cells["optimized"].update(render_cell_panel(race.optimized_label, race.optimized, race, "green"))
     layout["cells"].update(cells)
 
     layout["summary"].update(render_summary(race))
@@ -311,11 +329,15 @@ async def race_one(
     predicate_key: str,
     predicate_value: str,
     k: int,
+    baseline_label: str = "Baseline (000)",
+    optimized_label: str = "Optimized",
 ) -> RaceState:
     race = RaceState(
         query_text=query,
         predicate_display=f"{predicate_key} = {predicate_value!r}",
         started_at=time.perf_counter(),
+        baseline_label=baseline_label,
+        optimized_label=optimized_label,
     )
 
     # Send request.
@@ -417,7 +439,24 @@ async def main_async(args) -> int:
 
     console.print("[dim]waiting for demo to load indexes + embed sidecar...[/dim]")
     ready = await consume_until_ready(proc, console)
-    console.print(f"[green]ready[/green]: baseline N={ready['baseline_n']}, optimized N={ready['optimized_n']}")
+
+    # Build cell labels from the manifest features the binary forwarded in the
+    # ready event. Falls back to legacy "Baseline (000)" / "Optimized" if a
+    # field is missing (older binary).
+    b_cell = ready.get("baseline_cell", "000")
+    o_cell = ready.get("optimized_cell", "")
+    b_features = _features_label(ready.get("baseline_features"))
+    o_features = _features_label(ready.get("optimized_features"))
+    baseline_label = f"Baseline ({b_cell})" + (f" — {b_features}" if b_features and b_features != "none" else "")
+    if o_cell:
+        optimized_label = f"Optimized ({o_cell})" + (f" — {o_features}" if o_features and o_features != "none" else "")
+    else:
+        optimized_label = "Optimized"
+
+    console.print(
+        f"[green]ready[/green]: {baseline_label} N={ready['baseline_n']}, "
+        f"{optimized_label} N={ready['optimized_n']}"
+    )
     console.print()
 
     try:
@@ -427,7 +466,16 @@ async def main_async(args) -> int:
             if query.strip().lower() in ("q", "quit", "exit"):
                 break
             pred_key, pred_value = pick_predicate()
-            await race_one(proc, console, query, pred_key, pred_value, k=args.k)
+            await race_one(
+                proc,
+                console,
+                query,
+                pred_key,
+                pred_value,
+                k=args.k,
+                baseline_label=baseline_label,
+                optimized_label=optimized_label,
+            )
     finally:
         try:
             proc.stdin.write(b'{"event":"quit"}\n')

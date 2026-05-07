@@ -177,8 +177,8 @@ fn load_queries(path: &Path) -> anyhow::Result<QueriesFile> {
 
 // ---------- Live index handle ----------
 
-#[allow(dead_code)]
 struct LiveIndex {
+    #[allow(dead_code)]
     flavor: String,
     n_records: usize,
     blockfile_provider: BlockfileProvider,
@@ -469,11 +469,37 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Emit ready event.
+    // Emit ready event. Cell codes follow <adaptive><bloom><synopsis>
+    // (e.g. "110" = adaptive + bloom, no synopsis); the TUI uses these
+    // for labels.
+    let baseline_cell = format!(
+        "{}{}{}",
+        baseline.adaptive as u8,
+        baseline.bloom_enabled as u8,
+        baseline.synopsis_enabled as u8
+    );
+    let optimized_cell = format!(
+        "{}{}{}",
+        optimized.adaptive as u8,
+        optimized.bloom_enabled as u8,
+        optimized.synopsis_enabled as u8
+    );
     emit_event(&serde_json::json!({
         "event": "ready",
         "baseline_n": baseline.n_records,
         "optimized_n": optimized.n_records,
+        "baseline_cell": baseline_cell,
+        "optimized_cell": optimized_cell,
+        "baseline_features": {
+            "adaptive": baseline.adaptive,
+            "bloom": baseline.bloom_enabled,
+            "synopsis": baseline.synopsis_enabled,
+        },
+        "optimized_features": {
+            "adaptive": optimized.adaptive,
+            "bloom": optimized.bloom_enabled,
+            "synopsis": optimized.synopsis_enabled,
+        },
         "dim": data.dim,
         "queries": queries.queries.iter().map(|q| serde_json::json!({
             "id": q.id, "text": q.text, "query_type": q.query_type,
@@ -596,6 +622,13 @@ fn main() -> anyhow::Result<()> {
         let dist_arc = Arc::new(distance);
         let n_records_b = baseline.n_records;
         let n_records_o = optimized.n_records;
+        // Gate flags come from the manifest of each cell so the demo
+        // automatically follows whichever flavor was built (cell 110 today,
+        // cell 111 if synopsis ever returns).
+        let baseline_do_bloom = baseline.bloom_enabled;
+        let baseline_do_synopsis = baseline.synopsis_enabled;
+        let optimized_do_bloom = optimized.bloom_enabled;
+        let optimized_do_synopsis = optimized.synopsis_enabled;
 
         let t0 = Instant::now();
         let br_for_b = br_arc.clone();
@@ -628,8 +661,8 @@ fn main() -> anyhow::Result<()> {
                     &allowed_b,
                     &gt_b,
                     &pred_b,
-                    /*do_bloom=*/ false,
-                    /*do_synopsis=*/ false,
+                    baseline_do_bloom,
+                    baseline_do_synopsis,
                     k,
                     t0,
                     cache_for_b,
@@ -648,8 +681,8 @@ fn main() -> anyhow::Result<()> {
                     &allowed_o,
                     &gt_o,
                     &pred_o,
-                    /*do_bloom=*/ true,
-                    /*do_synopsis=*/ true,
+                    optimized_do_bloom,
+                    optimized_do_synopsis,
                     k,
                     t0,
                     cache_for_o,

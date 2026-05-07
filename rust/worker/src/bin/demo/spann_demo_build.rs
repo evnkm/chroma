@@ -114,32 +114,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // effect on a meaningfully wide candidate set, not a 1-head probe.
     params.search_nprobe = 32;
 
-    // Build cell 000 (baseline) and cell 111 (optimized).
-    eprintln!("[demo-build] building baseline (cell 000) ...");
-    let baseline = build_one(
-        &out_baseline,
-        BuildFlavor::Baseline,
-        &data,
-        n,
-        params.clone(),
-        bloom_capacity_factor,
-        synopsis_top_k,
-        synopsis_max_card,
-    )
-    .await?;
+    // Build cell 000 (baseline) and the demo's optimized cell.
+    let skip_baseline = env::var("DEMO_SKIP_BASELINE").is_ok();
+    let skip_optimized = env::var("DEMO_SKIP_OPTIMIZED").is_ok();
+    let baseline = if skip_baseline {
+        eprintln!("[demo-build] skipping baseline (DEMO_SKIP_BASELINE set)");
+        BuildResult { build_ms: 0.0, blob_bytes: 0 }
+    } else {
+        eprintln!("[demo-build] building baseline (cell 000) ...");
+        build_one(
+            &out_baseline,
+            BuildFlavor::Baseline,
+            &data,
+            n,
+            params.clone(),
+            bloom_capacity_factor,
+            synopsis_top_k,
+            synopsis_max_card,
+        )
+        .await?
+    };
 
-    eprintln!("[demo-build] building optimized (cell 111) ...");
-    let optimized = build_one(
-        &out_optimized,
-        BuildFlavor::Optimized,
-        &data,
-        n,
-        params.clone(),
-        bloom_capacity_factor,
-        synopsis_top_k,
-        synopsis_max_card,
-    )
-    .await?;
+    let optimized = if skip_optimized {
+        eprintln!("[demo-build] skipping optimized (DEMO_SKIP_OPTIMIZED set)");
+        BuildResult { build_ms: 0.0, blob_bytes: 0 }
+    } else {
+        eprintln!("[demo-build] building optimized ...");
+        build_one(
+            &out_optimized,
+            BuildFlavor::Optimized,
+            &data,
+            n,
+            params.clone(),
+            bloom_capacity_factor,
+            synopsis_top_k,
+            synopsis_max_card,
+        )
+        .await?
+    };
 
     // Write queries.json (for the demo binary to load without re-reading the .bin).
     eprintln!("[demo-build] writing {} ...", queries_out.display());
@@ -181,7 +193,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum BuildFlavor {
     /// Cell 000 — no bloom, no synopsis. Adaptive=off (baseline gets fixed nprobe).
     Baseline,
-    /// Cell 111 — bloom + synopsis, adaptive=on.
+    /// Cell 110 — bloom + adaptive nprobe, no synopsis. (Demo comparison cell.)
     Optimized,
 }
 
@@ -201,7 +213,11 @@ async fn build_one(
     synopsis_max_card: u32,
 ) -> Result<BuildResult, Box<dyn std::error::Error>> {
     let bloom_enabled = matches!(flavor, BuildFlavor::Optimized);
-    let synopsis_enabled = matches!(flavor, BuildFlavor::Optimized);
+    // Demo cell 110: bloom + adaptive nprobe, no synopsis. The synthetic and
+    // realistic queries we ship with already make a strong "bloom alone is
+    // worth it" point; synopsis is left out of the demo build to keep the
+    // story focused.
+    let synopsis_enabled = false;
 
     // Reset the storage dir so we don't half-merge with prior runs.
     if out_dir.exists() {
