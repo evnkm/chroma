@@ -1,0 +1,11 @@
+{
+  "dataset": "sift1m",
+  "n_records": 1000000,
+  "n_queries": 50,
+  "buckets": 1000,
+  "selectivity": 0.001,
+  "probe_nbr_seed": 32,
+  "index_metadata": {
+    "unified": {"build_ms": 1106967, "blob_storage_bytes": 198421969}
+  }
+}
