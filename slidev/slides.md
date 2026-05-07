@@ -380,8 +380,8 @@ Beat slide. Single sentence. Pause.
   <div class="eyebrow mb-10 text-center">three approaches</div>
   <h2 class="serif text-center" style="font-size: 3.4rem; line-height: 1.15">
     1. Filter-adaptive nprobes <br/>
-    2. Bloom filters <br/>
-    3. Metadata synposes
+    2. Metadata synposes <br/>
+    3. Bloom filters <br/>
   </h2>
 </div>
 ---
