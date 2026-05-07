@@ -6,9 +6,6 @@
   "selectivity": 0.001,
   "probe_nbr_seed": 32,
   "index_metadata": {
-    "none": {"build_ms": 3474, "blob_storage_bytes": 0},
-    "bloom": {"build_ms": 3593, "blob_storage_bytes": 365352},
-    "synopsis": {"build_ms": 3616, "blob_storage_bytes": 777599},
-    "both": {"build_ms": 3746, "blob_storage_bytes": 1178651}
+    "unified": {"build_ms": 3773, "blob_storage_bytes": 1176724}
   }
 }

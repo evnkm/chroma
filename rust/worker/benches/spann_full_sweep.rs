@@ -6,11 +6,16 @@
 // Cell labels follow the existing convention: "<a><b><s>" (e.g. 011 = bloom
 // + synopsis, no adaptive). The all-off cell (000) is the baseline.
 //
-// Builds 4 unique SPANN indexes (none / bloom / synopsis / both) and reuses
-// each via 2 readers (adaptive on/off). Per-query metrics: recall@k,
-// latency, heads_rng (post probe), heads_fetched (post gate), drop_ratio,
-// candidates_before/after_filter, bad_drops. Per-cell: index_build_ms,
-// blob_storage_bytes.
+// Builds ONE unified SPANN index (with both bloom + synopsis enabled) and
+// reuses it via 2 readers (adaptive on/off). All 8 cells share the same
+// underlying HNSW + posting lists; cell-level differences are applied at
+// READ time only (toggle which gates are invoked per query). This makes
+// cross-cell comparisons apples-to-apples.
+//
+// Per-query metrics: recall@k, latency, heads_rng (post probe),
+// heads_fetched (post gate), drop_ratio, candidates_before/after_filter,
+// bad_drops. Per-run: index_build_ms, blob_storage_bytes (single number,
+// shared across all cells).
 //
 // Uses the production probe-budget rule:
 //   probe_nbr = reader.determine_search_nprobe(N, k, Some(selectivity))
@@ -697,42 +702,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         selectivity
     );
 
-    // Build the 4 unique writer flavors. params.search_nprobe seeds the
-    // non-adaptive cells; adaptive cells overlay the size-based rule.
+    // Build a SINGLE writer with both bloom + synopsis enabled. All 8
+    // cells share this index — cell-level differences (gate on/off) are
+    // applied at READ time only, by toggling whether `gate_heads` and
+    // `gate_heads_synopsis` are called per query.
+    //
+    // This eliminates the index-build-noise confounder. Earlier versions
+    // of this bench built 4 separate writer flavors (none/bloom/synopsis/
+    // both); because the SPANN writer uses `rand::thread_rng()` during
+    // record assignment, even two `none` builds produce different HNSW
+    // structures. Cross-cell recall comparisons under that scheme were
+    // measuring index-build variance, not gate quality.
+    //
+    // The tokens passed to `add_to_postings_list` only affect the bloom
+    // cache; vector placement and HNSW assignment are unchanged. So
+    // building with both gate metadata enabled gives the same underlying
+    // index as building `none`, plus the auxiliary gate blobs.
     let mut params = InternalSpannConfiguration::default();
     params.search_nprobe = probe_nbr;
     let distance_function: DistanceFunction = params.clone().space.into();
     let rng_epsilon = params.search_rng_epsilon;
     let rng_factor = params.search_rng_factor;
 
-    let mut indexes: std::collections::HashMap<&'static str, BuiltIndex> =
-        std::collections::HashMap::new();
-    for flavor in ["none", "bloom", "synopsis", "both"] {
-        let idx = build_index(
-            flavor,
-            &records,
-            &record_buckets,
-            dim,
-            params.clone(),
-            bloom_capacity_factor,
-            bloom_doc_tokens_cache,
-            bloom_commit_rebuild,
-            synopsis_top_k,
-            synopsis_max_card,
-        )
-        .await;
-        indexes.insert(flavor, idx);
-    }
+    let unified = build_index(
+        "both",
+        &records,
+        &record_buckets,
+        dim,
+        params.clone(),
+        bloom_capacity_factor,
+        bloom_doc_tokens_cache,
+        bloom_commit_rebuild,
+        synopsis_top_k,
+        synopsis_max_card,
+    )
+    .await;
 
-    // Build readers — 8 of them, one per cell.
+    // Two readers (one per adaptive flag), both reading the unified
+    // index. All 8 cells share these readers; cells with adaptive=0 use
+    // `reader_off`, cells with adaptive=1 use `reader_on`.
     eprintln!("[setup] opening readers...");
-    let mut readers: std::collections::HashMap<&'static str, SpannIndexReader<'static>> =
-        std::collections::HashMap::new();
-    for cell in &CELLS {
-        let idx = indexes.get(cell.writer_flavor()).expect("flavor present");
-        let reader = make_reader(idx, cell.adaptive).await;
-        readers.insert(cell.code, reader);
-    }
+    let reader_off = make_reader(&unified, false).await;
+    let reader_on = make_reader(&unified, true).await;
 
     let bloom_pred = EqualityTokens::And(vec!["meta::bucket::int::0".to_string()]);
     let synopsis_pred =
@@ -751,7 +762,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (q_idx, query) in queries.iter().enumerate() {
         let gt = ground_truth(&records, query, &distance_function, &allowed_set, k).await;
         for cell in &CELLS {
-            let reader = readers.get(cell.code).unwrap();
+            let reader = if cell.adaptive { &reader_on } else { &reader_off };
             let row = run_query_for_cell(
                 cell,
                 reader,
@@ -819,16 +830,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.push_str(&format!("  \"selectivity\": {},\n", selectivity));
         s.push_str(&format!("  \"probe_nbr_seed\": {},\n", probe_nbr));
         s.push_str("  \"index_metadata\": {\n");
-        for (i, flavor) in ["none", "bloom", "synopsis", "both"].iter().enumerate() {
-            let idx = indexes.get(*flavor).unwrap();
-            s.push_str(&format!(
-                "    \"{}\": {{\"build_ms\": {:.0}, \"blob_storage_bytes\": {}}}{}\n",
-                flavor,
-                idx.build_ms,
-                idx.blob_storage_bytes,
-                if i + 1 < 4 { "," } else { "" }
-            ));
-        }
+        s.push_str(&format!(
+            "    \"unified\": {{\"build_ms\": {:.0}, \"blob_storage_bytes\": {}}}\n",
+            unified.build_ms, unified.blob_storage_bytes,
+        ));
         s.push_str("  }\n}\n");
         std::fs::write(&summary_path, s)?;
     }
@@ -839,19 +844,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "  dataset=sift1m n_records={} buckets={} k={} sel={:.4} probe_nbr_seed={}",
         n_records, n_buckets, k, selectivity, probe_nbr
     );
+    eprintln!(
+        "  unified index: build={:.0}ms blob={}B (shared across all 8 cells)",
+        unified.build_ms, unified.blob_storage_bytes,
+    );
     for code in CELL_CODES {
         let a = aggs.get(code).unwrap();
         let cell = CELLS.iter().find(|c| c.code == code).unwrap();
-        let idx = indexes.get(cell.writer_flavor()).unwrap();
         eprintln!(
-            "  cell={} (adapt={} bloom={} synop={}) {}  | build={:.0}ms blob={}B",
+            "  cell={} (adapt={} bloom={} synop={}) {}",
             code,
             cell.adaptive as u32,
             cell.bloom as u32,
             cell.synopsis as u32,
             a.fmt(),
-            idx.build_ms,
-            idx.blob_storage_bytes,
         );
     }
     eprintln!(
@@ -868,6 +874,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             total_bad_drops
         );
     }
-    let _ = (indexes, readers); // keep alive for lifetimes
+    let _ = (unified, reader_off, reader_on); // keep alive for lifetimes
     Ok(())
 }
