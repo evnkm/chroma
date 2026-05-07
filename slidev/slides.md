@@ -138,79 +138,118 @@ layout: default
 transition: fade
 ---
 <!-- =====================================================================
-SLIDE 2 — THE QUERY
-Magic-Move-style emphasis on the filter clause.
-===================================================================== -->
-<div class="absolute inset-0 flex flex-col justify-center px-24">
-  <div class="eyebrow mb-8">a real query</div>
-  <div class="serif text-5xl leading-tight" style="color: var(--ink-soft)">
-    Find products similar to this one,
-    <span style="color: var(--ink); background: #FFF7CC; padding: 0 0.3rem; border-radius: 2px">
-      but only ones under $50.
-    </span>
-  </div>
-  <div class="rule mt-12"></div>
-  <div class="grid grid-cols-2 gap-12 mt-6 max-w-4xl">
-    <div>
-      <div class="eyebrow mb-2">similarity</div>
-      <div class="text-lg" style="color: var(--ink-soft)">handled well today</div>
-    </div>
-    <div>
-      <div class="eyebrow mb-2" style="color: var(--miss)">filter</div>
-      <div class="text-lg" style="color: var(--ink-soft)">can be improved</div>
-    </div>
-  </div>
-</div>
-<div class="footer-rule"><span>1 · the problem</span></div>
----
-layout: default
-transition: fade
----
-<!-- =====================================================================
-SLIDE 3 — VECTOR SEARCH REFRESHER
+SLIDE 2 — VECTOR SEARCH
 0:12 – 0:35
 Replace placeholder with Manim NN_intro clip when ready.
 ===================================================================== -->
 <div class="absolute inset-0 grid grid-cols-12 gap-8 px-20 pt-24 pb-20">
   <div class="col-span-5 flex flex-col justify-center">
-    <div class="eyebrow mb-6">refresher</div>
-    <h2 class="serif mb-8">Items live in space.<br/>Similar items live close.</h2>
+    <div class="eyebrow mb-6">vector search</div>
+    <h2 class="serif mb-8">Embedding space<br/>Proximity means similarity</h2>
     <div class="text-lg leading-relaxed" style="color: var(--ink-soft)">
       Embed the query into the same space, grab the nearest neighbors.
-      ChromaDB does this across hundreds of millions of items in milliseconds.
     </div>
   </div>
   <div class="col-span-7 flex items-center justify-center min-h-0 min-w-0 overflow-visible">
     <NNScatter />
   </div>
 </div>
-<div class="footer-rule"><span>2 · vector search, briefly</span></div>
+<div class="footer-rule"><span>1 · vector search, briefly</span></div>
 ---
 layout: default
 transition: fade
 ---
 <!-- =====================================================================
-SLIDE 4 — ADD THE FILTER
-0:35 – 0:55
+SLIDE 3 — CHROMADB
+0:12 – 0:35
 ===================================================================== -->
 <div class="absolute inset-0 grid grid-cols-12 gap-8 px-20 pt-24 pb-20">
-  <div class="col-span-5 flex flex-col justify-center">
-    <div class="eyebrow mb-6">+ metadata</div>
-    <h2 class="serif mb-8">
-      The query you actually want:<br/>
-      <span style="color: var(--query)">nearest neighbors</span> among items
-      <span style="color: var(--miss)">passing the filter</span>.
-    </h2>
-    <div class="text-lg leading-relaxed" style="color: var(--ink-soft)">
-      When the filter is selective — say, one in a thousand — the matching
-      items are scattered thinly across the whole space.
+  <div class="col-span-6 flex flex-col justify-center">
+    <div class="eyebrow mb-6">the system we're building on</div>
+    <h2 class="serif mb-8">An open-source<br/>vector database.</h2>
+    <div class="text-lg leading-relaxed mb-5" style="color: var(--ink-soft)">
+      Chroma stores embeddings alongside their metadata and serves
+      filtered nearest-neighbor queries — the workload behind RAG, semantic
+      search, and agent memory.
+    </div>
+    <div class="grid grid-cols-3 gap-6 mt-4">
+      <div>
+        <div class="serif text-3xl" style="color: var(--ink)">19k+</div>
+        <div class="text-xs mt-1" style="color: var(--ink-soft)">GitHub stars</div>
+      </div>
+      <div>
+        <div class="serif text-3xl" style="color: var(--ink)">Rust</div>
+        <div class="text-xs mt-1" style="color: var(--ink-soft)">distributed core</div>
+      </div>
+      <div>
+        <div class="serif text-3xl" style="color: var(--ink)">SPANN</div>
+        <div class="text-xs mt-1" style="color: var(--ink-soft)">disk-based ANN index</div>
+      </div>
     </div>
   </div>
-  <div class="col-span-7 flex items-center justify-center min-h-0 min-w-0 overflow-visible">
+  <div class="col-span-6 flex flex-col items-center justify-center min-h-0 min-w-0 overflow-visible">
+    <img src="/chroma-logo.png" alt="Chroma logo"
+         class="w-full max-w-2xl" />
+  </div>
+</div>
+<div class="footer-rule"><span>2 · ChromaDB</span></div>
+---
+layout: default
+transition: fade
+---
+<!-- =====================================================================
+SLIDE 4 — Queries and filtered queries
+Click 0: heading + plain similarity query (top-left)
+Click 1: filtered query reveals below it
+Click 2: FilterScatter graphic reveals on the right
+===================================================================== -->
+<div class="absolute inset-0 px-20 pt-20 pb-16 grid grid-cols-12 gap-10">
+  <!-- LEFT: stacked queries -->
+  <div class="col-span-6 flex flex-col">
+    <div class="eyebrow mb-3">two kinds of query</div>
+    <h2 class="serif mb-8 text-4xl">
+      Similarity alone, or similarity
+      <span style="color: var(--miss)">plus a predicate</span>.
+    </h2>
+    <div class="flex flex-col gap-6">
+      <!-- TOP: plain similarity query (always visible) -->
+      <div>
+        <div class="eyebrow mb-2" style="color: var(--query)">similarity only</div>
+        <div class="serif italic text-base mb-3" style="color: var(--ink-soft)">
+          "How do I take care of my houseplant?"
+        </div>
+        <div class="rounded-sm px-5 py-3 mono text-sm"
+             style="background: #F4F6FB; border: 1px solid var(--rule); color: var(--ink); line-height: 1.6">
+          <span style="color: #7B8AAE">collection</span>.query(<br/>
+          &nbsp;&nbsp;query_embeddings=[<span style="color: var(--query)">q</span>],<br/>
+          &nbsp;&nbsp;n_results=<span style="color: var(--query)">10</span>,<br/>
+          )
+        </div>
+      </div>
+      <!-- BOTTOM: filtered query — reveals on click 1 -->
+      <div v-click="1">
+        <div class="eyebrow mb-2" style="color: var(--miss)">+ metadata filter</div>
+        <div class="serif italic text-base mb-3" style="color: var(--ink-soft)">
+          "How do I take care of my houseplant?,
+          <span style="color: var(--ink); background: #FFF7CC; padding: 0 0.25rem; border-radius: 2px">but only results from WikiHow</span>."
+        </div>
+        <div class="rounded-sm px-5 py-3 mono text-sm"
+             style="background: #F4F6FB; border: 1px solid var(--rule); color: var(--ink); line-height: 1.6">
+          <span style="color: #7B8AAE">collection</span>.query(<br/>
+          &nbsp;&nbsp;query_embeddings=[<span style="color: var(--query)">q</span>],<br/>
+          &nbsp;&nbsp;n_results=<span style="color: var(--query)">10</span>,<br/>
+          &nbsp;&nbsp;<span style="background: #FFF7CC; padding: 0 0.2rem; border-radius: 2px">where={<span style="color: var(--miss)">"domain"</span>: {<span style="color: var(--miss)">"="</span>: "wikihow.com"}},</span><br/>
+          )
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- RIGHT: FilterScatter — reveals on click 2 -->
+  <div v-click="2" class="col-span-6 flex items-center justify-center min-h-0 min-w-0 overflow-visible">
     <FilterScatter />
   </div>
 </div>
-<div class="footer-rule"><span>3 · the filter</span></div>
+<div class="footer-rule"><span>3 · types of query</span></div>
 ---
 layout: default
 transition: fade
@@ -225,11 +264,11 @@ Click 3: rank step
 Click 4: arrows connect them, header line completes
 ===================================================================== -->
 <div class="absolute inset-0 px-20 pt-20 pb-16 flex flex-col">
-  <div class="eyebrow mb-4">how spann searches</div>
+  <div class="eyebrow mb-4">how ChromaDB's spann searches</div>
   <h2 class="serif mb-10">
-    <span>Cluster. </span><span v-click="1">Pick the closest. </span><span v-click="2">Fetch. </span><span v-click="3">Rank.</span>
+    <span>Cluster. </span><span v-click="1">Pick the closest. </span><span v-click="2">Fetch. </span><span v-click="3">Filter. </span><span v-click="4">Rank.</span>
   </h2>
-  <div class="flex-1 grid grid-cols-4 gap-6 items-stretch relative">
+  <div class="flex-1 grid grid-cols-5 gap-6 items-stretch relative">
     <div class="border-l-2 pl-6" style="border-color: var(--rule)">
       <div class="bignum" style="color: var(--query)">1</div>
       <div class="serif text-2xl mt-2">cluster</div>
@@ -250,8 +289,14 @@ Click 4: arrows connect them, header line completes
     </div>
     <div v-click="3" class="border-l-2 pl-6" style="border-color: var(--rule)">
       <div class="bignum" style="color: var(--query)">4</div>
+      <div class="serif text-2xl mt-2">filter</div>
+      <div class="text-sm mt-3" style="color: var(--ink-soft)"> Apply filter using global inverted index to each value in the posting list</div>
+      <div class="mono text-xs mt-3" style="color: var(--ink-soft)">filter has some selectivity</div>
+    </div>
+    <div v-click="4" class="border-l-2 pl-6" style="border-color: var(--rule)">
+      <div class="bignum" style="color: var(--query)">5</div>
       <div class="serif text-2xl mt-2">rank</div>
-      <div class="text-sm mt-3" style="color: var(--ink-soft)">Brute-force compute distance over the fetched candidates. Apply filter. Return top-k.</div>
+      <div class="text-sm mt-3" style="color: var(--ink-soft)">Brute-force compute distance over the fetched candidates. Return top-k.</div>
       <div class="mono text-xs mt-3" style="color: var(--ink-soft)">k = 10</div>
     </div>
   </div>
@@ -312,31 +357,31 @@ Click 2: bignum recall slams in
     <!-- RIGHT: bignum recall, appears on click 2 -->
     <div class="col-span-5 flex flex-col">
       <div v-click="2">
-        <div class="bignum" style="color: var(--miss); font-size: 7rem">0.52</div>
+        <div class="bignum" style="color: var(--miss); font-size: 7rem">0.284</div>
         <div class="serif text-xl mt-2">baseline recall</div>
-        <div class="caption mt-1">SIFT1M · N=1M · 0.1% filter selectivity (k = 10)</div>
+        <div class="caption mt-1">SIFT1M · N=1M · 1% filter selectivity (k = 10)</div>
         <div class="text-sm mt-6 leading-snug" style="color: var(--ink-soft)">
-          Recall measures the fraction of true nearest neighbors the system actually returns. With selective filters, the baseline collapses.
+          Recall@k measures the fraction of top-k nearest neighbors the system actually returns. With selective filters, the baseline collapses.
         </div>
       </div>
     </div>
   </div>
 </div>
-<div class="footer-rule"><span>5 · the collapse</span></div>
+<div class="footer-rule"><span>5 · recall collapse</span></div>
 ---
 layout: center
 transition: slide-up
 ---
 <!-- =====================================================================
-SLIDE 7 — THE QUESTION
+SLIDE 7 — three approaches
 Beat slide. Single sentence. Pause.
 ===================================================================== -->
 <div class="px-24 max-w-5xl">
-  <div class="eyebrow mb-10 text-center">the question</div>
+  <div class="eyebrow mb-10 text-center">three approaches</div>
   <h2 class="serif text-center" style="font-size: 3.4rem; line-height: 1.15">
-    Make the routing step<br/>
-    pay attention to the filter,<br/>
-    without rebuilding the index.
+    1. Filter-adaptive nprobes <br/>
+    2. Bloom filters <br/>
+    3. Metadata synposes
   </h2>
 </div>
 ---
@@ -367,7 +412,7 @@ Click 5: recall bar updates
                 stroke="#2E5BFF" stroke-width="1.2" stroke-dasharray="5,3" opacity="0.7"/>
         <text v-click="3" x="240" y="22" text-anchor="middle"
               style="font-family: var(--slidev-fonts-mono); font-size: 13px; fill: var(--query)">
-          adaptive · nprobe = 192
+          adaptive · nprobe = 384
         </text>
         <!-- Default (tight) ring — appears on click 2 -->
         <circle v-click="2" cx="240" cy="180" r="60" fill="none"
@@ -416,7 +461,7 @@ Click 5: recall bar updates
       <!-- Caption that swaps based on click state -->
       <div class="text-base leading-snug" style="color: var(--ink-soft); min-height: 4rem">
         <div v-click="[1, 2]" class="serif italic">
-          With a 0.1% filter, six matches scattered across the centroid space.
+          With a 1% filter, six matches scattered across the centroid space.
         </div>
         <div v-click="[2, 3]" class="serif italic" style="color: var(--miss)">
           The default ring captures none of them.
@@ -424,9 +469,9 @@ Click 5: recall bar updates
         <div v-click="[3, 4]" class="serif italic" style="color: var(--match)">
           Widen the ring. All six matches are now inside.
         </div>
-        <div v-click="4" class="text-sm" style="color: var(--ink-soft)">
-          Scale the probe count inversely with selectivity, capped at <span class="mono" style="color: var(--ink)">8×</span> the base.
-        </div>
+        <!-- <div v-click="4" class="text-sm" style="color: var(--ink-soft)">
+          Scale the probe count inversely with selectivity, capped at <span class="mono" style="color: var(--ink)">16×</span> the base.
+        </div> -->
       </div>
       <!-- Formula card -->
       <div v-click="4" class="rounded-sm px-6 py-5"
@@ -435,42 +480,173 @@ Click 5: recall bar updates
           adaptive nprobe rule
         </div>
         <div class="mono text-base" style="color: var(--ink)">
-          nprobe = max(8, base / selectivity)
+          Scale the probe count inversely with selectivity, <br> capped at 16x the base
         </div>
-        <div class="mono text-xs mt-3" style="color: var(--ink-soft)">
-          base = 24 (≤500K) · 32 (≤1M) · 64 (>1M)
+        <!-- <div class="mono text-xs mt-3" style="color: var(--ink-soft)">
+          capped at 16x the base
         </div>
         <div class="mono text-xs mt-1" style="color: var(--ink-soft)">
-          capped at base × MAX_FACTOR (= 8)
-        </div>
+          capped at base × MAX_FACTOR (= 16)
+        </div> -->
       </div>
       <!-- Recall result -->
       <div v-click="5">
         <RecallBars
           :rows="[
-            { label: 'baseline',          value: 0.52, color: '#D14A4A' },
-            { label: 'adaptive nprobe',   value: 0.73, color: '#2E5BFF', highlight: true },
+            { label: 'baseline',          value: 0.284, color: '#D14A4A' },
+            { label: 'adaptive nprobe',   value: 0.958, color: '#2E5BFF', highlight: true },
           ]"
         />
       </div>
     </div>
   </div>
 </div>
-<div class="footer-rule"><span>6 · approach 1: adaptive nprobe</span></div>
+<div class="footer-rule"><span>7 · approach 1: adaptive nprobe</span></div>
 ---
 layout: default
 transition: fade
 ---
 <!-- =====================================================================
-SLIDE 9 — FIX 2: BLOOM FILTERS (click-staged build, 7 clicks)
+SLIDE 9 — FIX 3: SYNOPSES (click-staged, 5 clicks)
+3:00 – 3:30
+Click 0: title + idea
+Click 1: value-count table appears for one cluster
+Click 2: predicate "category = books" overlays, count of 0 highlights
+Click 3: skip badge appears
+Click 4: stage swaps to Pareto plot
+===================================================================== -->
+<div class="absolute inset-0 px-20 pt-16 pb-16 flex flex-col">
+  <div class="mb-6">
+    <div class="eyebrow mb-3">approach 2 of 3</div>
+    <h2 class="serif text-5xl">Probe the right clusters<br/>based on exact counts.</h2>
+  </div>
+  <div class="flex-1 relative">
+    <!-- Stage A: synopsis table mechanism, visible until click 4 -->
+    <div v-click="[0, 4]" class="absolute inset-0 grid grid-cols-12 gap-12 items-center">
+      <!-- LEFT: explanation -->
+      <div class="col-span-5 flex flex-col gap-6">
+        <div class="text-lg leading-relaxed" style="color: var(--ink-soft)">
+          For each cluster, store the exact number of documents matching every metadata value.
+        </div>
+        <div v-click="2" class="text-base leading-snug" style="color: var(--ink-soft)">
+          A predicate hits the table directly. If the count is provably zero, skip.
+        </div>
+        <div v-click="3" class="text-sm leading-snug" style="color: var(--ink-soft)">
+          No false positives. No false negatives. ~9 MB total for 100K docs.
+        </div>
+      </div>
+      <!-- RIGHT: synopsis table for a cluster -->
+      <div class="col-span-7 flex flex-col items-center gap-6">
+        <!-- Cluster glyph -->
+        <div class="flex items-center gap-6">
+          <svg viewBox="0 0 100 100" class="w-24 h-24">
+            <circle cx="50" cy="50" r="38" fill="#FBFAF7" stroke="#D9D6CE" stroke-width="1.5"/>
+            <g fill="#0E1626" opacity="0.7">
+              <circle cx="38" cy="42" r="2"/><circle cx="58" cy="36" r="2"/>
+              <circle cx="65" cy="52" r="2"/><circle cx="48" cy="58" r="2"/>
+              <circle cx="34" cy="56" r="2"/><circle cx="60" cy="64" r="2"/>
+              <circle cx="44" cy="48" r="2"/><circle cx="50" cy="68" r="2"/>
+            </g>
+          </svg>
+          <div class="mono text-xs" style="color: var(--ink-soft)">cluster 47<br/>26 docs</div>
+        </div>
+        <!-- Synopsis table -->
+        <div v-click="1" class="rounded-sm overflow-hidden"
+             style="border: 1px solid var(--rule); background: var(--paper); width: 22rem">
+          <div class="mono text-xs uppercase px-4 py-2"
+               style="background: #F4F6FB; color: var(--ink-soft); letter-spacing: 0.15em; border-bottom: 1px solid var(--rule)">
+            synopsis · domain
+          </div>
+          <table class="w-full mono text-sm">
+            <tbody>
+              <tr style="border-bottom: 1px solid var(--rule)">
+                <td class="px-4 py-2" style="color: var(--ink)">reddit.com</td>
+                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">15</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--rule)">
+                <td class="px-4 py-2" style="color: var(--ink)">wikipedia.org</td>
+                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">8</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--rule)"
+                  :class="{ 'synopsis-zero-row': true }">
+                <td class="px-4 py-2"
+                    :style="{ color: 'var(--ink)', transition: 'color 0.4s' }">wikihow.com</td>
+                <td class="px-4 py-2 text-right"
+                    :style="{ fontWeight: 500, transition: 'color 0.4s' }">
+                  <span :style="{ color: 'var(--ink)' }">0</span>
+                </td>
+              </tr>
+              <tr>
+                <td class="px-4 py-2" style="color: var(--ink)">webmd.com</td>
+                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">3</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- Predicate + verdict -->
+        <div v-click="2" class="flex items-center gap-4 mt-2">
+          <div class="px-4 py-2 rounded-sm border-2 mono text-sm"
+               :style="{ borderColor: 'var(--query)', color: 'var(--query)' }">
+            where domain = "wikihow.com"
+          </div>
+          <div class="serif italic" style="color: var(--ink-soft)">→ count is 0 →</div>
+          <div v-click="3" class="px-4 py-2 rounded-sm border-2"
+               :style="{ borderColor: 'var(--miss)', color: 'var(--miss)' }">
+            <span class="serif font-medium">skip</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Stage B: side-by-side recall + latency bars, appears on click 4 -->
+    <div v-click="4" class="absolute inset-0 flex flex-col px-4">
+      <h2 class="serif text-4xl mb-8">Results.</h2>
+      <div class="flex-1 grid grid-cols-2 gap-16 items-center">
+      <div class="flex flex-col items-center">
+        <div class="eyebrow mb-6 self-start">recall@10</div>
+        <RecallBars
+          :rows="[
+            { label: 'baseline',                   value: 0.284, color: '#D14A4A' },
+            { label: 'adaptive nprobe',            value: 0.958, color: '#7B8AAE' },
+            { label: 'adaptive + synopses',        value: 0.958, color: '#2E5BFF', highlight: true },
+          ]"
+          metric="recall"
+          :decimals="3"
+          caption="↑ recall@10 · higher is better"
+        />
+      </div>
+      <div class="flex flex-col items-center">
+        <div class="eyebrow mb-6 self-start">mean latency</div>
+        <RecallBars
+          :rows="[
+            { label: 'baseline',                   value: 2.21,  color: '#7B8AAE' },
+            { label: 'adaptive nprobe',            value: 23.80, color: '#D14A4A' },
+            { label: 'adaptive + synopses',        value: 8.87,  color: '#2E5BFF', highlight: true },
+          ]"
+          metric="latency"
+          unit="ms"
+          :max="25"
+          :decimals="2"
+          caption="↓ mean query latency · lower is better"
+        />
+      </div>
+    </div>
+  </div>
+</div>
+<div class="footer-rule"><span>8 · approach 2: synopses</span></div>
+---
+layout: default
+transition: fade
+---
+<!-- =====================================================================
+SLIDE 10 — FIX 2: BLOOM FILTERS (click-staged build, 7 clicks)
 2:25 – 3:00
 Each click reveals the next conceptual beat. Spacebar advances.
 See slide_bloom_gate.md for the click-by-click VO mapping.
 ===================================================================== -->
 <div class="absolute inset-0 px-16 pt-16 pb-16 flex flex-col">
   <div class="mb-8">
-    <div class="eyebrow mb-3">approach 2 of 3</div>
-    <h2 class="serif text-5xl">Ask the cluster<br/>before fetching it.</h2>
+    <div class="eyebrow mb-3">approach 3 of 3</div>
+    <h2 class="serif text-5xl">Probe the clusters<br/>probabilistically</h2>
   </div>
   <div class="flex-1 relative">
     <!-- ===== STAGE A: cluster + bit array intro ===== -->
@@ -518,7 +694,7 @@ See slide_bloom_gate.md for the click-by-click VO mapping.
         <div class="mono text-base" style="color: var(--ink-soft)">query:</div>
         <div class="px-4 py-2 rounded-sm border-2 mono text-base"
              :style="{ borderColor: 'var(--query)', color: 'var(--query)', background: 'var(--paper)' }">
-          where category = "shoes"
+          where domain = "wikihow.com"
         </div>
       </div>
       <div class="relative">
@@ -576,7 +752,7 @@ See slide_bloom_gate.md for the click-by-click VO mapping.
       </div>
       <div class="flex flex-col gap-6 max-w-xs">
         <div>
-          <div class="bignum text-7xl" style="color: var(--match); line-height: 1">~74%</div>
+          <div class="bignum text-7xl" style="color: var(--match); line-height: 1">~72%</div>
           <div class="serif text-xl mt-2">skipped before fetch</div>
         </div>
         <div class="rule"></div>
@@ -586,12 +762,12 @@ See slide_bloom_gate.md for the click-by-click VO mapping.
           can't possibly contain a match.
         </div>
         <div class="mono text-xs" style="color: var(--ink-soft)">
-          256 candidates → ~70 fetched
+          32 candidates → ~9 fetched
         </div>
       </div>
     </div>
   </div>
-  <div class="footer-rule"><span>7 · approach 2: bloom filters</span></div>
+  <div class="footer-rule"><span>8 · approach 3: bloom filters</span></div>
 </div>
 <script setup>
 const bloomBits = [
@@ -627,122 +803,7 @@ Continuation of slide 9; bars now updated.
     </div>
   </div>
 </div>
-<div class="footer-rule"><span>7 · approach 2: bloom filters</span></div>
----
-layout: default
-transition: fade
----
-<!-- =====================================================================
-SLIDE 10 — FIX 3: SYNOPSES (click-staged, 5 clicks)
-3:00 – 3:30
-Click 0: title + idea
-Click 1: value-count table appears for one cluster
-Click 2: predicate "category = books" overlays, count of 0 highlights
-Click 3: skip badge appears
-Click 4: stage swaps to Pareto plot
-===================================================================== -->
-<div class="absolute inset-0 px-20 pt-16 pb-16 flex flex-col">
-  <div class="mb-6">
-    <div class="eyebrow mb-3">approach 3 of 3</div>
-    <h2 class="serif text-5xl">Keep an exact count<br/>per cluster.</h2>
-  </div>
-  <div class="flex-1 relative">
-    <!-- Stage A: synopsis table mechanism, visible until click 4 -->
-    <div v-click="[0, 4]" class="absolute inset-0 grid grid-cols-12 gap-12 items-center">
-      <!-- LEFT: explanation -->
-      <div class="col-span-5 flex flex-col gap-6">
-        <div class="text-lg leading-relaxed" style="color: var(--ink-soft)">
-          For each cluster, store the exact number of documents matching every metadata value.
-        </div>
-        <div v-click="2" class="text-base leading-snug" style="color: var(--ink-soft)">
-          A predicate hits the table directly. If the count is provably zero, skip.
-        </div>
-        <div v-click="3" class="text-sm leading-snug" style="color: var(--ink-soft)">
-          No false positives. No false negatives. ~9 MB total for 100K docs.
-        </div>
-      </div>
-      <!-- RIGHT: synopsis table for a cluster -->
-      <div class="col-span-7 flex flex-col items-center gap-6">
-        <!-- Cluster glyph -->
-        <div class="flex items-center gap-6">
-          <svg viewBox="0 0 100 100" class="w-24 h-24">
-            <circle cx="50" cy="50" r="38" fill="#FBFAF7" stroke="#D9D6CE" stroke-width="1.5"/>
-            <g fill="#0E1626" opacity="0.7">
-              <circle cx="38" cy="42" r="2"/><circle cx="58" cy="36" r="2"/>
-              <circle cx="65" cy="52" r="2"/><circle cx="48" cy="58" r="2"/>
-              <circle cx="34" cy="56" r="2"/><circle cx="60" cy="64" r="2"/>
-              <circle cx="44" cy="48" r="2"/><circle cx="50" cy="68" r="2"/>
-            </g>
-          </svg>
-          <div class="mono text-xs" style="color: var(--ink-soft)">cluster 47<br/>26 docs</div>
-        </div>
-        <!-- Synopsis table -->
-        <div v-click="1" class="rounded-sm overflow-hidden"
-             style="border: 1px solid var(--rule); background: var(--paper); width: 22rem">
-          <div class="mono text-xs uppercase px-4 py-2"
-               style="background: #F4F6FB; color: var(--ink-soft); letter-spacing: 0.15em; border-bottom: 1px solid var(--rule)">
-            synopsis · category
-          </div>
-          <table class="w-full mono text-sm">
-            <tbody>
-              <tr style="border-bottom: 1px solid var(--rule)">
-                <td class="px-4 py-2" style="color: var(--ink)">shoes</td>
-                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">15</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--rule)">
-                <td class="px-4 py-2" style="color: var(--ink)">bags</td>
-                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">8</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--rule)"
-                  :class="{ 'synopsis-zero-row': true }">
-                <td class="px-4 py-2"
-                    :style="{ color: 'var(--ink)', transition: 'color 0.4s' }">books</td>
-                <td class="px-4 py-2 text-right"
-                    :style="{ fontWeight: 500, transition: 'color 0.4s' }">
-                  <span :style="{ color: 'var(--ink)' }">0</span>
-                </td>
-              </tr>
-              <tr>
-                <td class="px-4 py-2" style="color: var(--ink)">food</td>
-                <td class="px-4 py-2 text-right" style="color: var(--ink); font-weight: 500">3</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <!-- Predicate + verdict -->
-        <div v-click="2" class="flex items-center gap-4 mt-2">
-          <div class="px-4 py-2 rounded-sm border-2 mono text-sm"
-               :style="{ borderColor: 'var(--query)', color: 'var(--query)' }">
-            where category = "books"
-          </div>
-          <div class="serif italic" style="color: var(--ink-soft)">→ count is 0 →</div>
-          <div v-click="3" class="px-4 py-2 rounded-sm border-2"
-               :style="{ borderColor: 'var(--miss)', color: 'var(--miss)' }">
-            <span class="serif font-medium">skip</span>
-          </div>
-        </div>
-      </div>
-    </div>
-    <!-- Stage B: Pareto plot, appears on click 4 -->
-    <div v-click="4" class="absolute inset-0 grid grid-cols-12 gap-12 items-center">
-      <div class="col-span-5 flex flex-col gap-4">
-        <div class="serif text-2xl">A strict Pareto win.</div>
-        <div class="text-base leading-snug" style="color: var(--ink-soft)">
-          At 1% selectivity: recall stays above 0.95 while we fetch 74% fewer clusters than baseline.
-        </div>
-        <div class="text-sm mt-2" style="color: var(--ink-soft)">
-          No other configuration matches both axes.
-        </div>
-      </div>
-      <div class="col-span-7 flex items-center justify-center">
-        <img src="/plots/recall_vs_io_v2.png" class="w-full max-w-2xl rounded-sm"
-             style="border: 1px solid var(--rule)"
-             alt="Recall vs heads_fetched across the full N × selectivity matrix"/>
-      </div>
-    </div>
-  </div>
-</div>
-<div class="footer-rule"><span>8 · approach 3: synopses</span></div>
+<div class="footer-rule"><span>8 · approach 2: bloom filters</span></div>
 ---
 layout: default
 transition: fade

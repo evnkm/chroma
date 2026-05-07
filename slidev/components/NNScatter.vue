@@ -33,7 +33,7 @@
     <!-- bounded caption; raw SVG text can overflow its parent in Slidev scaling -->
     <foreignObject x="40" y="378" width="440" height="34">
       <div xmlns="http://www.w3.org/1999/xhtml" class="scatter-caption">
-        embedding space (2D for the picture · 768D in practice)
+        embedding space (2D here · 768D in practice)
       </div>
     </foreignObject>
   </svg>

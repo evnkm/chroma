@@ -65,8 +65,8 @@
       />
       <foreignObject x="10" y="7" width="104" height="30">
         <div xmlns="http://www.w3.org/1999/xhtml" class="where-label">
-          <div>WHERE category</div>
-          <div class="where-value">= "shoes"</div>
+          <div>WHERE domain</div>
+          <div class="where-value">= "wikihow.com"</div>
         </div>
       </foreignObject>
     </g>

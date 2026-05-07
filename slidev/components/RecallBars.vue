@@ -9,8 +9,8 @@
           {{ row.label }}
         </span>
         <span class="text-sm font-mono" style="color: var(--ink-soft)">
-          recall <span :style="{ color: row.color, fontWeight: 600 }">
-            {{ row.placeholder || row.value.toFixed(2) }}
+          {{ metric }} <span :style="{ color: row.color, fontWeight: 600 }">
+            {{ row.placeholder || row.value.toFixed(decimals) }}{{ unit ? ' ' + unit : '' }}
           </span>
         </span>
       </div>
@@ -18,7 +18,7 @@
         <div
           class="h-full rounded-sm transition-all"
           :style="{
-            width: (row.value * 100) + '%',
+            width: ((row.value / max) * 100) + '%',
             background: row.color,
             opacity: row.highlight === false ? 0.55 : 1,
             transition: 'width 0.6s ease-out'
@@ -28,13 +28,18 @@
     </div>
 
     <div class="mt-6 text-xs font-mono" style="color: var(--ink-soft)">
-      ↑ recall@10 · 0.1% selectivity · k = 10
+      {{ caption }}
     </div>
   </div>
 </template>
 
 <script setup>
 defineProps({
-  rows: { type: Array, required: true }
+  rows:     { type: Array,  required: true },
+  metric:   { type: String, default: 'recall' },
+  unit:     { type: String, default: '' },
+  max:      { type: Number, default: 1.0 },
+  decimals: { type: Number, default: 2 },
+  caption:  { type: String, default: '↑ recall@10 · 1% selectivity · k = 10' }
 });
 </script>
