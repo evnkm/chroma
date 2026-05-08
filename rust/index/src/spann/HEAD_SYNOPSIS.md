@@ -517,9 +517,8 @@ appears in the metadata inverted index regardless of which
 compaction wrote it. The §8 fallback only sees docs the SPANN writer
 touched this commit cycle, so heads with any "untouched" live doc
 are skipped (gate falls back to keep — safe but lossy). Empirical
-parity validated in `LOGS_PLANS/synopsis-recall-study.md`: both
-build paths produce equivalent drop_ratio (~0.69) and iso-I/O
-Δrecall (+0.35–0.43) with `bad_drops = 0`.
+parity: both build paths produce equivalent drop_ratio (~0.69) and
+iso-I/O Δrecall (+0.35–0.43) with `bad_drops = 0`.
 
 ---
 

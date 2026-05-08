@@ -448,8 +448,6 @@ pub struct HeadRawCounts {
 /// `top_k=64` and a workload of, say, 100 distinct values, ~99% of
 /// heads ended up with `other_counts[key] > 0`, forcing the gate to
 /// return "unknown" for every query and silently degrading to a no-op.
-/// See `LOGS_PLANS/synopsis-recall-study.md` "Skepticism / caveats" for
-/// the empirical write-up of that trap.
 ///
 /// Under auto-promotion, `top_k_per_key` only kicks in for keys that
 /// genuinely exceed `max_cardinality` — exactly the keys where
